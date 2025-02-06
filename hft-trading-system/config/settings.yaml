@@ -2,8 +2,10 @@ trading_mode: "paper"  # Change to "live" for real trading
 
 api_keys:
   ibkr: "your_ibkr_key_here"
-  github: "your_github_api_key_here"
 
 execution:
   enable_fpga_acceleration: true
+  trading_environment:
+    paper: {host: "127.0.0.1", port: 7497, client_id: 1}
+    live: {host: "127.0.0.1", port: 7496, client_id: 2}
 
