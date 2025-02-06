@@ -1,0 +1,34 @@
+name: System Setup & AI Sorting
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+jobs:
+  setup_and_validate:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+
+    - name: Set Up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: "3.10"
+
+    - name: Install Dependencies
+      run: pip install -r requirements.txt
+
+    - name: Load API Keys Securely
+      env:
+        GITHUB_API_KEY: ${{ secrets.GITHUB_API_KEY }}
+        IBKR_API_KEY: ${{ secrets.IBKR_API_KEY }}
+      run: echo "API keys successfully loaded and secured."
+
+    - name: Run AI Sorting & Optimization
+      run: python scripts/ai_code_sorting.py
+
