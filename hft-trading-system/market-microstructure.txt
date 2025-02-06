@@ -1,0 +1,368 @@
+[Previous code remains the same until _maybe_create_snapshot]
+
+    def _maybe_create_snapshot(self, symbol: str) -> None:
+        """Create order book snapshot if needed"""
+        last_snapshot = None
+        if symbol in self._book_snapshots:
+            snapshots = self._book_snapshots[symbol]
+            if snapshots:
+                last_snapshot = snapshots[-1]
+
+        current_time = datetime.utcnow()
+        if (not last_snapshot or 
+            (current_time - last_snapshot.timestamp).total_seconds() >= 
+            self.snapshot_interval):
+            
+            # Create new snapshot
+            book = self._order_books[symbol]
+            snapshot = self._create_snapshot(symbol, book, current_time)
+            
+            # Initialize if needed
+            if symbol not in self._book_snapshots:
+                self._book_snapshots[symbol] = deque(
+                    maxlen=self.analysis_window
+                )
+            
+            self._book_snapshots[symbol].append(snapshot)
+    
+    def _create_snapshot(
+        self,
+        symbol: str,
+        book: Dict,
+        timestamp: datetime
+    ) -> OrderBookSnapshot:
+        """Create order book snapshot"""
+        # Get best bid/ask
+        best_bid = max(book['bids'].keys()) if book['bids'] else Decimal('0')
+        best_ask = min(book['asks'].keys()) if book['asks'] else Decimal('inf')
+        
+        # Calculate mid price and spread
+        mid_price = (best_bid + best_ask) / Decimal('2')
+        spread = best_ask - best_bid
+        
+        # Calculate depths
+        bid_depth = sum(book['bids'].values())
+        ask_depth = sum(book['asks'].values())
+        
+        # Calculate imbalance
+        total_depth = bid_depth + ask_depth
+        imbalance = float((bid_depth - ask_depth) / total_depth) if total_depth > 0 else 0
+        
+        return OrderBookSnapshot(
+            timestamp=timestamp,
+            bids=book['bids'].copy(),
+            asks=book['asks'].copy(),
+            mid_price=mid_price,
+            spread=spread,
+            bid_depth=bid_depth,
+            ask_depth=ask_depth,
+            imbalance=imbalance
+        )
+    
+    def _analyze_trade_impact(self, symbol: str, trade: Dict) -> None:
+        """Analyze market impact of trade"""
+        if symbol not in self._book_snapshots:
+            return
+        
+        snapshots = self._book_snapshots[symbol]
+        if not snapshots:
+            return
+        
+        # Get pre-trade snapshot
+        pre_trade = snapshots[-1]
+        
+        # Calculate price impact
+        trade_price = Decimal(str(trade['price']))
+        price_impact = abs(trade_price - pre_trade.mid_price)
+        
+        # Calculate volume impact
+        trade_volume = Decimal(str(trade['volume']))
+        side = trade['side']
+        
+        if side == 'BUY':
+            depth_used = trade_volume / pre_trade.ask_depth
+        else:
+            depth_used = trade_volume / pre_trade.bid_depth
+        
+        # Store impact metrics
+        trade['price_impact'] = float(price_impact)
+        trade['depth_used'] = float(depth_used)
+    
+    def _update_market_maker_profiles(
+        self,
+        symbol: str,
+        update: Dict
+    ) -> None:
+        """Update market maker profiles based on order activity"""
+        participant_id = update.get('participant_id')
+        if not participant_id:
+            return
+        
+        # Initialize if needed
+        if participant_id not in self._market_makers:
+            self._market_makers[participant_id] = MarketMakerProfile(
+                participant_id=participant_id,
+                quote_presence=0.0,
+                spread_contribution=0.0,
+                volume_contribution=0.0,
+                avg_quote_size=Decimal('0'),
+                position_holding_time=0.0,
+                inventory_range=(Decimal('0'), Decimal('0')),
+                cancellation_rate=0.0,
+                toxicity_exposure=0.0
+            )
+        
+        profile = self._market_makers[participant_id]
+        
+        # Update order tracking
+        if participant_id not in self._participant_orders:
+            self._participant_orders[participant_id] = {}
+        
+        order_id = update.get('order_id')
+        if not order_id:
+            return
+        
+        if update['type'] == 'ADD':
+            self._participant_orders[participant_id][order_id] = {
+                'timestamp': datetime.utcnow(),
+                'price': Decimal(str(update['price'])),
+                'volume': Decimal(str(update['volume'])),
+                'side': update['side']
+            }
+        elif update['type'] == 'DELETE':
+            if order_id in self._participant_orders[participant_id]:
+                order = self._participant_orders[participant_id][order_id]
+                holding_time = (
+                    datetime.utcnow() - order['timestamp']
+                ).total_seconds()
+                
+                # Update profile metrics
+                profile.position_holding_time = (
+                    profile.position_holding_time * 0.95 + 
+                    holding_time * 0.05
+                )
+                profile.cancellation_rate = (
+                    profile.cancellation_rate * 0.95 + 
+                    (1.0 if holding_time < 1.0 else 0.0) * 0.05
+                )
+                
+                del self._participant_orders[participant_id][order_id]
+        
+        # Update quote presence
+        total_quotes = len(self._participant_orders[participant_id])
+        profile.quote_presence = min(
+            1.0,
+            total_quotes / self.config.get('mm_min_quotes', 10)
+        )
+        
+        # Update quote size
+        if total_quotes > 0:
+            avg_size = sum(
+                order['volume'] 
+                for order in self._participant_orders[participant_id].values()
+            ) / Decimal(str(total_quotes))
+            profile.avg_quote_size = (
+                profile.avg_quote_size * Decimal('0.95') + 
+                avg_size * Decimal('0.05')
+            )
+        
+        # Check if participant qualifies as market maker
+        self._check_market_maker_status(participant_id)
+    
+    def _check_market_maker_status(self, participant_id: str) -> None:
+        """Check if participant qualifies as market maker"""
+        profile = self._market_makers[participant_id]
+        
+        # Calculate score based on various metrics
+        score = (
+            profile.quote_presence * 0.3 +
+            profile.spread_contribution * 0.3 +
+            profile.volume_contribution * 0.2 +
+            (1.0 - profile.cancellation_rate) * 0.2
+        )
+        
+        # Update market maker status
+        is_market_maker = score >= self.mm_detection_threshold
+        
+        if is_market_maker and participant_id not in self._market_makers:
+            self.logger.log_event(
+                "MARKET_MAKER_DETECTED",
+                f"New market maker detected: {participant_id}",
+                extra_data={"score": score}
+            )
+        elif not is_market_maker and participant_id in self._market_makers:
+            self.logger.log_event(
+                "MARKET_MAKER_REMOVED",
+                f"Participant no longer qualifies as market maker: {participant_id}",
+                extra_data={"score": score}
+            )
+            del self._market_makers[participant_id]
+    
+    def _calculate_toxicity_metrics(self, symbol: str) -> Dict[str, float]:
+        """Calculate market toxicity metrics"""
+        metrics = {}
+        
+        if symbol not in self._trade_flow:
+            return metrics
+        
+        trades = list(self._trade_flow[symbol])
+        if not trades:
+            return metrics
+        
+        # Calculate adverse selection
+        price_changes = []
+        for i in range(len(trades) - 1):
+            price_change = (
+                Decimal(str(trades[i+1]['price'])) - 
+                Decimal(str(trades[i]['price']))
+            )
+            price_changes.append(float(price_change))
+        
+        metrics['adverse_selection'] = np.mean(price_changes) if price_changes else 0
+        
+        # Calculate trade clustering
+        trade_times = [t['timestamp'] for t in trades]
+        intervals = np.diff([t.timestamp() for t in trade_times])
+        metrics['trade_clustering'] = np.std(intervals) if len(intervals) > 1 else 0
+        
+        # Calculate order flow toxicity
+        buy_volume = sum(
+            float(t['volume']) for t in trades 
+            if t['side'] == 'BUY'
+        )
+        sell_volume = sum(
+            float(t['volume']) for t in trades 
+            if t['side'] == 'SELL'
+        )
+        total_volume = buy_volume + sell_volume
+        
+        metrics['order_flow_toxicity'] = abs(
+            buy_volume - sell_volume
+        ) / total_volume if total_volume > 0 else 0
+        
+        return metrics
+    
+    def _calculate_effective_spread(
+        self,
+        snapshots: List[OrderBookSnapshot]
+    ) -> Decimal:
+        """Calculate effective spread from snapshots"""
+        spreads = [s.spread for s in snapshots]
+        weights = [
+            float(s.bid_depth + s.ask_depth) for s in snapshots
+        ]
+        total_weight = sum(weights)
+        
+        if total_weight == 0:
+            return Decimal('0')
+        
+        weighted_spread = sum(
+            float(spread) * weight 
+            for spread, weight in zip(spreads, weights)
+        ) / total_weight
+        
+        return Decimal(str(weighted_spread))
+    
+    def _calculate_market_impact(
+        self,
+        snapshots: List[OrderBookSnapshot]
+    ) -> Decimal:
+        """Calculate average market impact"""
+        impacts = []
+        
+        for i in range(len(snapshots) - 1):
+            pre = snapshots[i]
+            post = snapshots[i+1]
+            
+            # Calculate price movement
+            price_change = abs(post.mid_price - pre.mid_price)
+            
+            # Calculate volume
+            volume_change = abs(
+                (post.bid_depth + post.ask_depth) -
+                (pre.bid_depth + pre.ask_depth)
+            )
+            
+            if volume_change > 0:
+                impact = price_change / volume_change
+                impacts.append(float(impact))
+        
+        return Decimal(str(np.mean(impacts))) if impacts else Decimal('0')
+    
+    def _calculate_resiliency(
+        self,
+        snapshots: List[OrderBookSnapshot]
+    ) -> float:
+        """Calculate market resiliency"""
+        if len(snapshots) < 2:
+            return 0.0
+        
+        # Calculate spread recovery rate
+        spread_changes = []
+        for i in range(len(snapshots) - 1):
+            spread_change = float(
+                (snapshots[i+1].spread - snapshots[i].spread) /
+                snapshots[i].spread
+            )
+            spread_changes.append(spread_change)
+        
+        # Negative changes indicate spread reduction (recovery)
+        recovery_rate = -np.mean(
+            [c for c in spread_changes if c < 0]
+        ) if spread_changes else 0
+        
+        return float(recovery_rate)
+    
+    def _start_analysis(self) -> None:
+        """Start analysis threads"""
+        def analysis_thread():
+            while True:
+                try:
+                    self._run_periodic_analysis()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        MicrostructureError(
+                            f"Analysis thread failed: {str(e)}"
+                        )
+                    )
+                time.sleep(self.snapshot_interval)
+        
+        thread = threading.Thread(target=analysis_thread, daemon=True)
+        thread.start()
+    
+    def _run_periodic_analysis(self) -> None:
+        """Run periodic market microstructure analysis"""
+        for symbol in self._order_books:
+            try:
+                # Update liquidity metrics
+                metrics = self.get_liquidity_metrics(symbol)
+                if metrics:
+                    self.logger.log_event(
+                        "LIQUIDITY_UPDATE",
+                        f"Updated liquidity metrics for {symbol}",
+                        extra_data=metrics.__dict__
+                    )
+                
+                # Update toxicity metrics
+                toxicity = self._calculate_toxicity_metrics(symbol)
+                if toxicity:
+                    self.logger.log_event(
+                        "TOXICITY_UPDATE",
+                        f"Updated toxicity metrics for {symbol}",
+                        extra_data=toxicity
+                    )
+                
+                # Update market maker profiles
+                for mm_id in self._market_makers:
+                    self._check_market_maker_status(mm_id)
+                    
+            except Exception as e:
+                self.error_handler.handle_error(
+                    MicrostructureError(
+                        f"Periodic analysis failed for {symbol}: {str(e)}"
+                    )
+                )
+
+class MicrostructureError(Exception):
+    """Custom exception for market microstructure errors"""
+    pass

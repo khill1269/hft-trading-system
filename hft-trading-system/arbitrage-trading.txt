@@ -1,0 +1,286 @@
+[Previous code remains the same until _check_risk_limits]
+
+    def _check_risk_limits(self, opportunity: ArbitrageOpportunity) -> bool:
+        """Check if opportunity meets risk requirements"""
+        # Check position size
+        if opportunity.volume_constraint > self.max_position_size:
+            return False
+        
+        # Check execution time
+        if opportunity.estimated_duration > self.max_execution_time:
+            return False
+        
+        # Check risk manager limits
+        for symbol in opportunity.symbols:
+            if not self.risk_manager.check_trading_allowed(symbol):
+                return False
+        
+        # Check confidence score
+        if opportunity.confidence_score < self.config.get('min_confidence', 0.8):
+            return False
+        
+        return True
+    
+    async def _execute_trades(
+        self,
+        opportunity: ArbitrageOpportunity
+    ) -> Optional[ArbitrageTrade]:
+        """Execute all trades for an opportunity"""
+        trades = []
+        entry_time = datetime.utcnow()
+        
+        try:
+            # Execute each trade in the path
+            for trade in opportunity.execution_path:
+                if trade['action'] == 'BUY':
+                    order = await self.execution_engine.submit_market_order(
+                        symbol=trade['symbol'],
+                        side='BUY',
+                        quantity=opportunity.volume_constraint,
+                        venue=trade['venue']
+                    )
+                elif trade['action'] == 'SELL':
+                    order = await self.execution_engine.submit_market_order(
+                        symbol=trade['symbol'],
+                        side='SELL',
+                        quantity=opportunity.volume_constraint,
+                        venue=trade['venue']
+                    )
+                else:  # Currency conversion trade
+                    order = await self.execution_engine.submit_conversion(
+                        from_currency=trade['from'],
+                        to_currency=trade['to'],
+                        amount=opportunity.volume_constraint,
+                        rate=trade['rate']
+                    )
+                
+                if not order:
+                    raise ArbitrageError(f"Failed to execute trade: {trade}")
+                
+                trades.append(order)
+            
+            # Calculate execution metrics
+            exit_time = datetime.utcnow()
+            execution_latency = int((exit_time - entry_time).total_seconds() * 1000)
+            realized_profit = self._calculate_realized_profit(trades)
+            
+            return ArbitrageTrade(
+                opportunity_id=opportunity.id,
+                trades=trades,
+                entry_time=entry_time,
+                exit_time=exit_time,
+                realized_profit=realized_profit,
+                execution_latency=execution_latency,
+                status="COMPLETED"
+            )
+            
+        except Exception as e:
+            # Handle partial execution
+            if trades:
+                await self._handle_partial_execution(trades)
+            raise ArbitrageError(f"Trade execution failed: {str(e)}")
+    
+    async def _handle_partial_execution(self, trades: List[Dict]) -> None:
+        """Handle cleanup of partially executed trades"""
+        try:
+            # Reverse executed trades
+            for trade in reversed(trades):
+                if trade['side'] == 'BUY':
+                    await self.execution_engine.submit_market_order(
+                        symbol=trade['symbol'],
+                        side='SELL',
+                        quantity=trade['executed_quantity'],
+                        venue=trade['venue']
+                    )
+                else:
+                    await self.execution_engine.submit_market_order(
+                        symbol=trade['symbol'],
+                        side='BUY',
+                        quantity=trade['executed_quantity'],
+                        venue=trade['venue']
+                    )
+        except Exception as e:
+            self.error_handler.handle_error(
+                ArbitrageError(f"Failed to handle partial execution: {str(e)}")
+            )
+    
+    def _calculate_realized_profit(self, trades: List[Dict]) -> Decimal:
+        """Calculate realized profit from executed trades"""
+        total_cost = Decimal('0')
+        total_proceeds = Decimal('0')
+        
+        for trade in trades:
+            if trade['side'] == 'BUY':
+                total_cost += Decimal(str(trade['executed_quantity'])) * \
+                            Decimal(str(trade['executed_price']))
+            else:
+                total_proceeds += Decimal(str(trade['executed_quantity'])) * \
+                                Decimal(str(trade['executed_price']))
+        
+        return total_proceeds - total_cost
+    
+    async def _add_opportunity(self, opportunity: ArbitrageOpportunity) -> None:
+        """Add new arbitrage opportunity"""
+        with self._lock:
+            self._active_opportunities[opportunity.id] = opportunity
+            self._opportunity_counts[opportunity.type] += 1
+        
+        self.logger.log_event(
+            "ARBITRAGE_OPPORTUNITY",
+            f"New {opportunity.type.value} opportunity detected",
+            extra_data={
+                "profit": str(opportunity.profit_percentage),
+                "symbols": opportunity.symbols
+            }
+        )
+    
+    async def _recalculate_profit(
+        self,
+        opportunity: ArbitrageOpportunity
+    ) -> Decimal:
+        """Recalculate current profit for an opportunity"""
+        if opportunity.type == ArbitrageType.EXCHANGE:
+            # Recalculate exchange arbitrage profit
+            prices = await self._get_exchange_prices(
+                opportunity.symbols[0],
+                opportunity.symbols[1]
+            )
+            best_bid = max(prices, key=lambda x: x['bid'])
+            best_ask = min(prices, key=lambda x: x['ask'])
+            return (best_bid['bid'] - best_ask['ask']) / best_ask['ask']
+            
+        elif opportunity.type == ArbitrageType.TRIANGULAR:
+            # Recalculate triangular arbitrage profit
+            rates = [
+                await self.market_data_manager.get_rate(
+                    step['from'],
+                    step['to']
+                )
+                for step in opportunity.execution_path
+            ]
+            return Decimal(str(rates[0] * rates[1] * rates[2] - 1))
+            
+        elif opportunity.type == ArbitrageType.STATISTICAL:
+            # Recalculate statistical arbitrage profit
+            data1 = await self.market_data_manager.get_historical_data(
+                opportunity.symbols[0],
+                lookback_days=30
+            )
+            data2 = await self.market_data_manager.get_historical_data(
+                opportunity.symbols[1],
+                lookback_days=30
+            )
+            z_score = self._calculate_spread_zscore(data1, data2)
+            return self._estimate_stat_arb_profit(abs(z_score))
+        
+        return Decimal('0')
+    
+    async def _check_volume_constraints(
+        self,
+        opportunity: ArbitrageOpportunity
+    ) -> bool:
+        """Check if required volume is available"""
+        for symbol in opportunity.symbols:
+            volume = await self.market_data_manager.get_available_volume(
+                symbol,
+                opportunity.venues[0]
+            )
+            if volume < opportunity.volume_constraint:
+                return False
+        return True
+    
+    def _calculate_spread_zscore(
+        self,
+        data1: List[Dict],
+        data2: List[Dict]
+    ) -> float:
+        """Calculate z-score of price spread"""
+        # Extract price series
+        prices1 = [float(d['close']) for d in data1]
+        prices2 = [float(d['close']) for d in data2]
+        
+        # Calculate spread
+        spreads = [p1 - p2 for p1, p2 in zip(prices1, prices2)]
+        
+        # Calculate z-score
+        mean = sum(spreads) / len(spreads)
+        std = (sum((x - mean) ** 2 for x in spreads) / len(spreads)) ** 0.5
+        
+        current_spread = spreads[-1]
+        return (current_spread - mean) / std if std > 0 else 0
+    
+    def _estimate_stat_arb_profit(self, z_score: float) -> Decimal:
+        """Estimate potential profit from statistical arbitrage"""
+        # Simple profit estimation based on z-score
+        base_profit = Decimal('0.001')  # 0.1% base profit
+        z_score_factor = Decimal(str(abs(z_score) / 10))  # Scale z-score
+        return base_profit * z_score_factor
+    
+    def _calculate_risk_factors(self, venues: List[str]) -> Dict[str, float]:
+        """Calculate risk factors for the opportunity"""
+        return {
+            'execution_risk': self._calculate_execution_risk(venues),
+            'market_risk': self._calculate_market_risk(venues),
+            'counterparty_risk': self._calculate_counterparty_risk(venues)
+        }
+    
+    def _calculate_execution_risk(self, venues: List[str]) -> float:
+        """Calculate execution risk based on venues"""
+        # Risk factors by venue
+        venue_risks = {
+            'INTERNAL': 0.1,
+            'EXCHANGE_A': 0.2,
+            'EXCHANGE_B': 0.3
+        }
+        return max(venue_risks.get(venue, 0.5) for venue in venues)
+    
+    def _calculate_market_risk(self, venues: List[str]) -> float:
+        """Calculate market risk based on venues"""
+        # Base market risk
+        base_risk = 0.2
+        # Add venue-specific risk
+        venue_count = len(venues)
+        return base_risk * (1 + (venue_count - 1) * 0.1)
+    
+    def _calculate_counterparty_risk(self, venues: List[str]) -> float:
+        """Calculate counterparty risk based on venues"""
+        # Risk factors by venue type
+        venue_risks = {
+            'INTERNAL': 0.05,
+            'EXCHANGE_A': 0.15,
+            'EXCHANGE_B': 0.25
+        }
+        return sum(venue_risks.get(venue, 0.5) for venue in venues) / len(venues)
+    
+    def _calculate_confidence_score(
+        self,
+        profit: Decimal,
+        venues: List[str]
+    ) -> float:
+        """Calculate confidence score for opportunity"""
+        # Base confidence from profit
+        base_confidence = float(min(profit * 100, 1.0))
+        
+        # Adjust for risk factors
+        risk_factors = self._calculate_risk_factors(venues)
+        risk_adjustment = sum(risk_factors.values()) / len(risk_factors)
+        
+        # Calculate final score
+        confidence = base_confidence * (1 - risk_adjustment)
+        return max(min(confidence, 1.0), 0.0)
+    
+    def _estimate_execution_time(self, num_trades: int) -> int:
+        """Estimate execution time in milliseconds"""
+        base_time = 100  # Base time per trade in ms
+        return base_time * num_trades
+    
+    def _calculate_volume_constraint(
+        self,
+        volumes: List[float]
+    ) -> Decimal:
+        """Calculate volume constraint based on available volumes"""
+        return Decimal(str(min(volumes)))
+
+class ArbitrageError(Exception):
+    """Custom exception for arbitrage errors"""
+    pass

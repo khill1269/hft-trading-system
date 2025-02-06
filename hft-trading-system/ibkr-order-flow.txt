@@ -1,0 +1,335 @@
+[Previous code remains the same until _get_volume_profile]
+
+    async def _get_volume_profile(self, symbol: str) -> Dict[datetime, float]:
+        """Get historical volume profile for VWAP calculation"""
+        try:
+            # Get historical data
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=20)  # Use 20 days of history
+            
+            historical_data = await self.market_data_client.get_historical_data(
+                symbol,
+                start_time,
+                end_time,
+                bar_size='1 min'
+            )
+            
+            if not historical_data:
+                return {}
+            
+            # Create volume profile by time of day
+            volume_profile = {}
+            total_volume = 0
+            
+            for bar in historical_data:
+                time_of_day = bar.index.time()
+                volume = float(bar['volume'])
+                
+                if time_of_day in volume_profile:
+                    volume_profile[time_of_day] += volume
+                else:
+                    volume_profile[time_of_day] = volume
+                
+                total_volume += volume
+            
+            # Normalize to percentages
+            for time_of_day in volume_profile:
+                volume_profile[time_of_day] /= total_volume
+            
+            return volume_profile
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Failed to get volume profile: {str(e)}")
+            )
+            return {}
+    
+    def _create_vwap_slices(
+        self,
+        total_quantity: float,
+        volume_profile: Dict[datetime, float],
+        max_participation: float
+    ) -> List[Tuple[float, datetime]]:
+        """Create time-volume slices for VWAP execution"""
+        try:
+            slices = []
+            remaining_quantity = total_quantity
+            
+            # Sort times
+            sorted_times = sorted(volume_profile.keys())
+            
+            for time_of_day in sorted_times:
+                if remaining_quantity <= 0:
+                    break
+                
+                volume_share = volume_profile[time_of_day]
+                target_quantity = min(
+                    total_quantity * volume_share,
+                    remaining_quantity,
+                    total_quantity * max_participation
+                )
+                
+                if target_quantity > 0:
+                    # Create target time
+                    now = datetime.now()
+                    target_time = datetime.combine(now.date(), time_of_day)
+                    if target_time < now:
+                        target_time += timedelta(days=1)
+                    
+                    slices.append((target_quantity, target_time))
+                    remaining_quantity -= target_quantity
+            
+            return slices
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Failed to create VWAP slices: {str(e)}")
+            )
+            return []
+    
+    def _start_order_monitor(self) -> None:
+        """Start order monitoring thread"""
+        def monitor():
+            while True:
+                try:
+                    self._monitor_active_orders()
+                    self._check_order_conditions()
+                    self._update_order_states()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        OrderFlowError(f"Order monitoring failed: {str(e)}")
+                    )
+                time.sleep(1)
+        
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
+    
+    def _monitor_active_orders(self) -> None:
+        """Monitor active orders and update states"""
+        for order_id, order_data in self._active_orders.items():
+            try:
+                # Check order status
+                status = self.execution_client.get_order_status(order_id)
+                if not status:
+                    continue
+                
+                # Update order state
+                prev_status = order_data.get('status')
+                new_status = status['status']
+                
+                if new_status != prev_status:
+                    order_data['status'] = new_status
+                    self._handle_status_change(order_id, prev_status, new_status)
+                
+                # Check child orders if any
+                if order_id in self._child_orders:
+                    self._monitor_child_orders(order_id)
+                
+            except Exception as e:
+                self.error_handler.handle_error(
+                    OrderFlowError(f"Order monitoring failed for {order_id}: {str(e)}")
+                )
+    
+    def _monitor_child_orders(self, parent_id: int) -> None:
+        """Monitor child orders of a parent order"""
+        child_orders = self._child_orders[parent_id]
+        total_filled = 0
+        
+        for child_id in child_orders:
+            status = self.execution_client.get_order_status(child_id)
+            if status:
+                total_filled += status['filled_quantity']
+        
+        # Update parent order filled quantity
+        parent_order = self._active_orders[parent_id]
+        parent_order['filled_quantity'] = total_filled
+    
+    def _check_order_conditions(self) -> None:
+        """Check and handle order conditions"""
+        current_time = datetime.now()
+        
+        for order_id, order_data in self._active_orders.items():
+            try:
+                route = self._order_routes.get(order_id)
+                if not route or not route.conditions:
+                    continue
+                
+                # Check each condition
+                for condition in route.conditions:
+                    if isinstance(condition, TimeCondition):
+                        self._check_time_condition(order_id, condition, current_time)
+                    elif isinstance(condition, PriceCondition):
+                        self._check_price_condition(order_id, condition)
+                
+            except Exception as e:
+                self.error_handler.handle_error(
+                    OrderFlowError(f"Condition check failed for {order_id}: {str(e)}")
+                )
+    
+    def _check_time_condition(
+        self,
+        order_id: int,
+        condition: TimeCondition,
+        current_time: datetime
+    ) -> None:
+        """Check time-based conditions"""
+        try:
+            condition_time = datetime.strptime(condition.time, '%H:%M:%S').time()
+            current_time_of_day = current_time.time()
+            
+            if condition.isMore and current_time_of_day >= condition_time:
+                self._handle_condition_met(order_id, "TIME_CONDITION_MET")
+            elif not condition.isMore and current_time_of_day <= condition_time:
+                self._handle_condition_met(order_id, "TIME_CONDITION_MET")
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Time condition check failed: {str(e)}")
+            )
+    
+    def _check_price_condition(
+        self,
+        order_id: int,
+        condition: PriceCondition
+    ) -> None:
+        """Check price-based conditions"""
+        try:
+            order_data = self._active_orders[order_id]
+            symbol = order_data['params']['symbol']
+            
+            current_price = self.market_data_client.get_latest_price(symbol)
+            if not current_price:
+                return
+            
+            if condition.isMore and current_price >= condition.price:
+                self._handle_condition_met(order_id, "PRICE_CONDITION_MET")
+            elif not condition.isMore and current_price <= condition.price:
+                self._handle_condition_met(order_id, "PRICE_CONDITION_MET")
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Price condition check failed: {str(e)}")
+            )
+    
+    def _handle_condition_met(self, order_id: int, condition_type: str) -> None:
+        """Handle when order condition is met"""
+        try:
+            order_data = self._active_orders[order_id]
+            strategy = self._order_strategies.get(order_id)
+            
+            self.logger.log_event(
+                condition_type,
+                f"Order condition met for {order_id}",
+                extra_data={
+                    "strategy": strategy.value if strategy else None,
+                    "order_status": order_data['status']
+                }
+            )
+            
+            # Handle strategy-specific logic
+            if strategy == OrderStrategy.TWAP:
+                asyncio.create_task(self._execute_twap_slice(order_id))
+            elif strategy == OrderStrategy.VWAP:
+                asyncio.create_task(self._execute_vwap_slice(order_id))
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Condition handling failed: {str(e)}")
+            )
+    
+    def _handle_status_change(
+        self,
+        order_id: int,
+        prev_status: str,
+        new_status: str
+    ) -> None:
+        """Handle order status changes"""
+        try:
+            order_data = self._active_orders[order_id]
+            strategy = self._order_strategies.get(order_id)
+            
+            self.logger.log_event(
+                "ORDER_STATUS_CHANGE",
+                f"Order {order_id} status changed from {prev_status} to {new_status}",
+                extra_data={
+                    "strategy": strategy.value if strategy else None,
+                    "order_data": order_data
+                }
+            )
+            
+            # Handle strategy-specific logic
+            if new_status == OrderStatus.FILLED:
+                if strategy == OrderStrategy.ICEBERG:
+                    asyncio.create_task(self._replenish_iceberg_order(order_id))
+                elif strategy in {OrderStrategy.TWAP, OrderStrategy.VWAP}:
+                    self._update_participation_rate(order_id)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Status change handling failed: {str(e)}")
+            )
+    
+    async def _replenish_iceberg_order(self, order_id: int) -> None:
+        """Replenish filled iceberg order"""
+        try:
+            order_data = self._active_orders[order_id]
+            route = self._order_routes[order_id]
+            
+            total_quantity = order_data['params']['quantity']
+            display_size = route.params['display_size']
+            filled_quantity = order_data.get('filled_quantity', 0)
+            
+            remaining = total_quantity - filled_quantity
+            if remaining > 0:
+                new_quantity = min(display_size, remaining)
+                
+                # Submit new visible order
+                params = order_data['params'].copy()
+                params['quantity'] = new_quantity
+                params['transmit'] = True
+                
+                new_order_id = await self.execution_client.submit_order(**params)
+                if new_order_id:
+                    self._child_orders[order_id].append(new_order_id)
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Iceberg replenishment failed: {str(e)}")
+            )
+    
+    def _update_participation_rate(self, order_id: int) -> None:
+        """Update participation rate for TWAP/VWAP orders"""
+        try:
+            order_data = self._active_orders[order_id]
+            route = self._order_routes[order_id]
+            
+            symbol = order_data['params']['symbol']
+            filled_quantity = order_data.get('filled_quantity', 0)
+            
+            # Get market volume
+            market_volume = self.market_data_client.get_recent_volume(symbol)
+            if market_volume > 0:
+                participation = filled_quantity / market_volume
+                
+                # Update route parameters
+                route.params['actual_participation'] = participation
+                
+                # Log participation rate
+                self.logger.log_event(
+                    "PARTICIPATION_UPDATE",
+                    f"Updated participation rate for {order_id}",
+                    extra_data={
+                        "participation": participation,
+                        "filled_quantity": filled_quantity,
+                        "market_volume": market_volume
+                    }
+                )
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Participation update failed: {str(e)}")
+            )
+
+class OrderFlowError(Exception):
+    """Custom exception for order flow errors"""
+    pass

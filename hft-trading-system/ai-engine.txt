@@ -1,0 +1,253 @@
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            model = model.cuda()
+            
+        return model
+    
+    def _get_output_size(self, model_type: ModelType) -> int:
+        """Get model output size based on type"""
+        if model_type == ModelType.PRICE_PREDICTION:
+            return 1  # Continuous price prediction
+        elif model_type == ModelType.TREND_PREDICTION:
+            return 3  # Up, Down, Sideways
+        elif model_type == ModelType.REGIME_DETECTION:
+            return 4  # Different market regimes
+        elif model_type == ModelType.EXECUTION_OPTIMIZATION:
+            return 2  # Optimal size and timing
+        return 1
+
+    async def get_prediction(self, symbol: str, model_type: ModelType) -> Dict:
+        """Get prediction for symbol using specified model type"""
+        try:
+            start_time = time.time()
+            
+            # Get model
+            model, metadata = self._get_model(model_type)
+            if not model:
+                return {}
+            
+            # Generate features
+            features = await self.feature_generator.generate_features(
+                symbol,
+                metadata.input_features,
+                self.market_data
+            )
+            
+            # Convert to tensor
+            x = torch.FloatTensor(features)
+            if torch.cuda.is_available():
+                x = x.cuda()
+            
+            # Get prediction
+            with torch.no_grad():
+                prediction = model(x)
+                
+            # Process prediction
+            result = self._process_prediction(prediction, model_type)
+            
+            # Track inference time
+            inference_time = (time.time() - start_time) * 1000
+            self._inference_times.append(inference_time)
+            
+            return result
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                AIError("Prediction failed", e)
+            )
+            return {}
+
+    def _get_model(self, model_type: ModelType) -> Tuple[Optional[DeepLearningModel], Optional[ModelMetadata]]:
+        """Get best performing model of specified type"""
+        type_models = [
+            (model, meta) for model_id, (model, meta) in self.models.items()
+            if meta.model_type == model_type
+        ]
+        
+        if not type_models:
+            return None, None
+            
+        # Get model with best performance
+        best_model, best_meta = max(
+            type_models,
+            key=lambda x: x[1].performance_metrics.get('accuracy', 0)
+        )
+        
+        return best_model, best_meta
+    
+    def _process_prediction(self, prediction: torch.Tensor, model_type: ModelType) -> Dict:
+        """Process model prediction based on type"""
+        pred = prediction.cpu().numpy()
+        
+        if model_type == ModelType.PRICE_PREDICTION:
+            return {
+                'predicted_price': float(pred[0]),
+                'confidence': self._calculate_confidence(pred)
+            }
+            
+        elif model_type == ModelType.TREND_PREDICTION:
+            probs = torch.softmax(prediction, dim=0).cpu().numpy()
+            return {
+                'trend': ['UP', 'DOWN', 'SIDEWAYS'][np.argmax(probs)],
+                'probabilities': {
+                    'up': float(probs[0]),
+                    'down': float(probs[1]),
+                    'sideways': float(probs[2])
+                },
+                'confidence': float(np.max(probs))
+            }
+            
+        elif model_type == ModelType.REGIME_DETECTION:
+            probs = torch.softmax(prediction, dim=0).cpu().numpy()
+            regimes = ['TRENDING', 'RANGING', 'VOLATILE', 'BREAKOUT']
+            return {
+                'regime': regimes[np.argmax(probs)],
+                'probabilities': {
+                    regime: float(prob) 
+                    for regime, prob in zip(regimes, probs)
+                },
+                'confidence': float(np.max(probs))
+            }
+            
+        elif model_type == ModelType.EXECUTION_OPTIMIZATION:
+            return {
+                'optimal_size': float(pred[0]),
+                'optimal_timing': float(pred[1]),
+                'confidence': self._calculate_confidence(pred)
+            }
+    
+    def _calculate_confidence(self, prediction: np.ndarray) -> float:
+        """Calculate prediction confidence score"""
+        # For regression tasks, use prediction variance
+        if len(prediction.shape) > 1 and prediction.shape[1] > 1:
+            return float(1.0 / (1.0 + np.var(prediction)))
+        return 0.8  # Default confidence
+    
+    async def train_model(self, model_id: str, training_data: Dict) -> bool:
+        """Train or update model with new data"""
+        try:
+            if self._training_in_progress:
+                return False
+                
+            self._training_in_progress = True
+            start_time = time.time()
+            
+            # Get model
+            if model_id not in self.models:
+                return False
+            
+            model, metadata = self.models[model_id]
+            
+            # Prepare training data
+            x_train = training_data['features']
+            y_train = training_data['labels']
+            
+            # Convert to tensors
+            x_train = torch.FloatTensor(x_train)
+            y_train = torch.FloatTensor(y_train)
+            
+            if torch.cuda.is_available():
+                x_train = x_train.cuda()
+                y_train = y_train.cuda()
+                
+            # Train model
+            await self._train_epoch(model, x_train, y_train, metadata.hyperparameters)
+            
+            # Update metadata
+            training_time = time.time() - start_time
+            metadata.training_time += training_time
+            self._training_times.append(training_time)
+            
+            # Evaluate performance
+            performance = await self._evaluate_model(model, x_train, y_train)
+            metadata.performance_metrics.update(performance)
+            
+            self._training_in_progress = False
+            return True
+            
+        except Exception as e:
+            self._training_in_progress = False
+            self.error_handler.handle_error(
+                AIError("Model training failed", e)
+            )
+            return False
+    
+    async def _train_epoch(
+        self,
+        model: DeepLearningModel,
+        x_train: torch.Tensor,
+        y_train: torch.Tensor,
+        hyperparameters: Dict
+    ) -> None:
+        """Train model for one epoch"""
+        # Set up optimizer
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=hyperparameters.get('learning_rate', 0.001)
+        )
+        
+        # Set up loss function
+        loss_fn = nn.MSELoss()
+        
+        # Train mode
+        model.train()
+        
+        # Training loop
+        batch_size = hyperparameters.get('batch_size', 32)
+        
+        for i in range(0, len(x_train), batch_size):
+            # Get batch
+            x_batch = x_train[i:i + batch_size]
+            y_batch = y_train[i:i + batch_size]
+            
+            # Forward pass
+            y_pred = model(x_batch)
+            loss = loss_fn(y_pred, y_batch)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Yield to other tasks occasionally
+            if i % (batch_size * 10) == 0:
+                await asyncio.sleep(0)
+
+class FeatureGenerator:
+    """Generate features for AI models"""
+    
+    async def generate_features(
+        self,
+        symbol: str,
+        feature_names: List[str],
+        market_data: 'MarketDataManager'
+    ) -> np.ndarray:
+        """Generate features from market data"""
+        features = []
+        
+        for feature_name in feature_names:
+            if feature_name.startswith('price_'):
+                # Price-based features
+                window = int(feature_name.split('_')[1])
+                feature = await self._generate_price_feature(symbol, window, market_data)
+            elif feature_name.startswith('volume_'):
+                # Volume-based features
+                window = int(feature_name.split('_')[1])
+                feature = await self._generate_volume_feature(symbol, window, market_data)
+            elif feature_name.startswith('technical_'):
+                # Technical indicators
+                indicator = feature_name.split('_')[1]
+                feature = await self._generate_technical_feature(symbol, indicator, market_data)
+            else:
+                # Custom features
+                feature = await self._generate_custom_feature(symbol, feature_name, market_data)
+            
+            features.append(feature)
+        
+        return np.array(features)
+
+class AIError(Exception):
+    """Custom exception for AI-related errors"""
+    def __init__(self, message: str, original_error: Optional[Exception] = None):
+        super().__init__(message)
+        self.original_error = original_error

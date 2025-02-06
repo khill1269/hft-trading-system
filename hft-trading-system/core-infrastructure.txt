@@ -1,0 +1,189 @@
+"""Core system infrastructure integrating all components"""
+from typing import Dict, Optional, Any
+from pathlib import Path
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+@dataclass
+class SystemConfig:
+    """Unified system configuration"""
+    # Core settings
+    base_path: Path
+    environment: str
+    log_level: str
+    
+    # Hardware settings
+    fpga_enabled: bool
+    network_interface: str
+    cpu_affinity: list[int]
+    
+    # Performance settings
+    buffer_size: int
+    max_latency_us: int
+    batch_size: int
+    
+    # Risk settings
+    max_position_size: float
+    risk_limits: Dict[str, float]
+    
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]) -> 'SystemConfig':
+        return cls(
+            base_path=Path(config.get('base_path', '.')),
+            environment=config.get('environment', 'development'),
+            log_level=config.get('log_level', 'INFO'),
+            fpga_enabled=config.get('fpga_enabled', False),
+            network_interface=config.get('network_interface', 'eth0'),
+            cpu_affinity=config.get('cpu_affinity', [0, 1]),
+            buffer_size=config.get('buffer_size', 1024 * 1024),
+            max_latency_us=config.get('max_latency_us', 100),
+            batch_size=config.get('batch_size', 100),
+            max_position_size=config.get('max_position_size', 1_000_000),
+            risk_limits=config.get('risk_limits', {})
+        )
+
+class CoreSystem:
+    """Integrated core system"""
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.logger = self._setup_logging()
+        self.thread_pool = ThreadPoolExecutor(max_workers=len(config.cpu_affinity))
+        
+        # Initialize subsystems
+        self.market_data = self._init_market_data()
+        self.execution = self._init_execution()
+        self.risk = self._init_risk()
+        self.monitoring = self._init_monitoring()
+        
+        # System state
+        self._is_running = False
+        self._lock = threading.Lock()
+    
+    def _setup_logging(self) -> 'LoggingManager':
+        """Set up enhanced logging"""
+        from improved_logging import LoggingManager
+        log_manager = LoggingManager()
+        log_manager.setup_logging(
+            log_dir=str(self.config.base_path / "logs"),
+            level=self.config.log_level,
+            console_output=self.config.environment == "development"
+        )
+        return log_manager
+    
+    def _init_market_data(self) -> 'MarketDataManager':
+        """Initialize optimized market data system"""
+        # Combine best features from all market data implementations
+        if self.config.fpga_enabled:
+            return FPGAMarketDataManager(self.config, self.logger)
+        return SoftwareMarketDataManager(self.config, self.logger)
+    
+    def _init_execution(self) -> 'ExecutionEngine':
+        """Initialize optimized execution system"""
+        # Combine best features from all execution implementations
+        return ExecutionEngine(
+            config=self.config,
+            logger=self.logger,
+            fpga_enabled=self.config.fpga_enabled
+        )
+    
+    def _init_risk(self) -> 'RiskManager':
+        """Initialize enhanced risk management"""
+        return RiskManager(
+            limits=self.config.risk_limits,
+            logger=self.logger
+        )
+    
+    def _init_monitoring(self) -> 'SystemMonitor':
+        """Initialize comprehensive monitoring"""
+        return SystemMonitor(
+            components=[
+                self.market_data,
+                self.execution,
+                self.risk
+            ],
+            logger=self.logger
+        )
+    
+    async def start(self) -> None:
+        """Start the system with optimized initialization"""
+        try:
+            # Optimize system
+            self._optimize_system()
+            
+            # Initialize components
+            await self._initialize_components()
+            
+            # Start processing
+            await self._start_processing()
+            
+            self._is_running = True
+            self.logger.info("System started successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start system: {str(e)}")
+            raise
+    
+    def _optimize_system(self) -> None:
+        """Apply system-wide optimizations"""
+        # Set CPU affinity
+        self._set_cpu_affinity()
+        
+        # Optimize network
+        self._optimize_network()
+        
+        # Configure memory
+        self._optimize_memory()
+    
+    def _set_cpu_affinity(self) -> None:
+        """Set CPU affinity for optimal performance"""
+        import psutil
+        process = psutil.Process()
+        process.cpu_affinity(self.config.cpu_affinity)
+    
+    def _optimize_network(self) -> None:
+        """Apply network optimizations"""
+        from hft_network import NetworkOptimizer
+        optimizer = NetworkOptimizer(self.config.network_interface)
+        optimizer.optimize_all()
+    
+    def _optimize_memory(self) -> None:
+        """Optimize memory settings"""
+        import resource
+        # Lock memory to prevent swapping
+        resource.mlockall(resource.MCL_CURRENT | resource.MCL_FUTURE)
+
+    async def _initialize_components(self) -> None:
+        """Initialize all components"""
+        init_tasks = [
+            self.market_data.initialize(),
+            self.execution.initialize(),
+            self.risk.initialize(),
+            self.monitoring.initialize()
+        ]
+        await asyncio.gather(*init_tasks)
+    
+    async def _start_processing(self) -> None:
+        """Start all processing loops"""
+        processing_tasks = [
+            self.market_data.start_processing(),
+            self.execution.start_processing(),
+            self.risk.start_monitoring(),
+            self.monitoring.start_monitoring()
+        ]
+        await asyncio.gather(*processing_tasks)
+    
+    async def stop(self) -> None:
+        """Stop the system"""
+        self._is_running = False
+        
+        # Stop components
+        await self.market_data.stop()
+        await self.execution.stop()
+        await self.risk.stop()
+        await self.monitoring.stop()
+        
+        # Cleanup
+        self.thread_pool.shutdown()
+        self.logger.info("System stopped successfully")

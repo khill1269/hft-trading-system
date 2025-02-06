@@ -1,0 +1,242 @@
+[Previous code remains the same until _execute_rebalancing]
+
+    def _calculate_rebalancing_trades(
+        self,
+        current_positions: Dict[str, float],
+        target_allocations: Dict[str, float]
+    ) -> List[Dict]:
+        """Calculate trades needed for rebalancing"""
+        trades = []
+        total_portfolio_value = self._calculate_portfolio_value(current_positions)
+        
+        # Calculate target position values
+        target_positions = {
+            symbol: total_portfolio_value * weight
+            for symbol, weight in target_allocations.items()
+        }
+        
+        # Calculate required trades
+        for symbol, target_value in target_positions.items():
+            current_value = current_positions.get(symbol, 0.0)
+            difference = target_value - current_value
+            
+            if abs(difference) > self.config.get('min_trade_value', 100):
+                price = self.market_data_manager.get_latest_price(symbol)
+                if price:
+                    quantity = difference / price
+                    trades.append({
+                        'symbol': symbol,
+                        'side': 'BUY' if difference > 0 else 'SELL',
+                        'quantity': abs(quantity)
+                    })
+        
+        return self._optimize_trade_sequence(trades)
+    
+    def _calculate_portfolio_value(
+        self,
+        positions: Dict[str, float]
+    ) -> float:
+        """Calculate total portfolio value"""
+        total_value = 0.0
+        for symbol, position in positions.items():
+            price = self.market_data_manager.get_latest_price(symbol)
+            if price:
+                total_value += position * price
+        return total_value
+    
+    def _optimize_trade_sequence(
+        self,
+        trades: List[Dict]
+    ) -> List[Dict]:
+        """Optimize trade execution sequence"""
+        # Sort trades by value (larger trades first)
+        trades_with_value = []
+        for trade in trades:
+            price = self.market_data_manager.get_latest_price(trade['symbol'])
+            if price:
+                value = trade['quantity'] * price
+                trades_with_value.append((value, trade))
+        
+        sorted_trades = [
+            trade for _, trade in sorted(
+                trades_with_value,
+                key=lambda x: abs(x[0]),
+                reverse=True
+            )
+        ]
+        
+        return sorted_trades
+    
+    def calibrate_quantum_parameters(self) -> None:
+        """Calibrate quantum algorithm parameters"""
+        try:
+            # Test quantum circuit performance
+            test_circuit = self.circuit_generator.create_feature_selection_circuit(
+                np.random.random(self.config.get('num_qubits', 10))
+            )
+            
+            # Run calibration experiments
+            results = []
+            for _ in range(10):
+                start_time = time.time()
+                job = execute(test_circuit, self.backend)
+                job.result()
+                execution_time = time.time() - start_time
+                results.append(execution_time)
+            
+            # Update parameters based on performance
+            avg_execution_time = np.mean(results)
+            if avg_execution_time > self.config.get('max_execution_time', 1.0):
+                # Reduce circuit complexity
+                self.config['circuit_depth'] = max(
+                    1,
+                    self.config.get('circuit_depth', 3) - 1
+                )
+            
+            self.logger.log_event(
+                "QUANTUM_CALIBRATION",
+                "Completed quantum parameter calibration",
+                extra_data={
+                    "avg_execution_time": avg_execution_time,
+                    "circuit_depth": self.config.get('circuit_depth', 3)
+                }
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                QuantumError(f"Quantum calibration failed: {str(e)}")
+            )
+    
+    def get_quantum_metrics(self) -> Dict[str, Any]:
+        """Get quantum system performance metrics"""
+        metrics = {
+            'circuit_depth': self.config.get('circuit_depth', 3),
+            'num_qubits': self.config.get('num_qubits', 10),
+            'optimization_success_rate': self._calculate_success_rate(),
+            'quantum_advantage': self._estimate_quantum_advantage(),
+            'error_rates': self._get_error_rates(),
+            'execution_times': self._get_execution_times()
+        }
+        return metrics
+    
+    def _calculate_success_rate(self) -> float:
+        """Calculate optimization success rate"""
+        try:
+            history = self.portfolio_optimizer._optimization_history
+            if not history:
+                return 0.0
+            
+            total_runs = sum(len(runs) for runs in history.values())
+            successful_runs = sum(
+                len([r for r in runs if r.success_probability > 0.5])
+                for runs in history.values()
+            )
+            
+            return successful_runs / total_runs if total_runs > 0 else 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _estimate_quantum_advantage(self) -> float:
+        """Estimate quantum advantage over classical methods"""
+        try:
+            quantum_times = []
+            classical_times = []
+            
+            for result in self.portfolio_optimizer._optimization_history.get(
+                QuantumAlgorithmType.QAOA.value, []
+            ):
+                quantum_times.append(result.execution_time)
+                # Simulate classical execution time
+                classical_times.append(
+                    result.execution_time * 
+                    2 ** (self.config.get('num_qubits', 10) / 2)
+                )
+            
+            if not quantum_times or not classical_times:
+                return 1.0
+            
+            return np.mean(classical_times) / np.mean(quantum_times)
+            
+        except Exception:
+            return 1.0
+    
+    def _get_error_rates(self) -> Dict[str, float]:
+        """Get quantum error rates"""
+        try:
+            error_rates = {
+                'readout_error': self.backend.configuration().readout_error,
+                'gate_error': self.backend.configuration().gate_error,
+                'decoherence_error': self._estimate_decoherence_error()
+            }
+            return error_rates
+            
+        except Exception:
+            return {
+                'readout_error': 0.0,
+                'gate_error': 0.0,
+                'decoherence_error': 0.0
+            }
+    
+    def _estimate_decoherence_error(self) -> float:
+        """Estimate decoherence error rate"""
+        try:
+            # Run test circuit with different wait times
+            error_rates = []
+            for wait_time in [1, 2, 4, 8]:
+                circuit = QuantumCircuit(1, 1)
+                circuit.h(0)
+                circuit.delay(wait_time)
+                circuit.h(0)
+                circuit.measure(0, 0)
+                
+                counts = execute(
+                    circuit,
+                    self.backend,
+                    shots=1000
+                ).result().get_counts()
+                
+                error_rate = counts.get('1', 0) / 1000
+                error_rates.append(error_rate)
+            
+            # Fit exponential decay
+            times = np.array([1, 2, 4, 8])
+            rates = np.array(error_rates)
+            
+            # Calculate decay rate
+            decay_rate = -np.log(rates[-1] / rates[0]) / (times[-1] - times[0])
+            return decay_rate
+            
+        except Exception:
+            return 0.0
+    
+    def _get_execution_times(self) -> Dict[str, float]:
+        """Get quantum execution time statistics"""
+        try:
+            times = []
+            for runs in self.portfolio_optimizer._optimization_history.values():
+                times.extend([r.execution_time for r in runs])
+            
+            if not times:
+                return {
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0
+                }
+            
+            return {
+                'mean': float(np.mean(times)),
+                'std': float(np.std(times)),
+                'min': float(np.min(times)),
+                'max': float(np.max(times))
+            }
+            
+        except Exception:
+            return {
+                'mean': 0.0,
+                'std': 0.0,
+                'min': 0.0,
+                'max': 0.0
+            }
+

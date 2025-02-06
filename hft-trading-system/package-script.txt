@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "${BLUE}Packaging High-Frequency Trading System...${NC}"
+
+# Check if virtual environment is activated
+if [ -z "$VIRTUAL_ENV" ]; then
+    echo -e "${RED}Please activate virtual environment first.${NC}"
+    exit 1
+fi
+
+# Clean previous builds
+echo -e "${GREEN}Cleaning previous builds...${NC}"
+rm -rf build/ dist/ *.egg-info/
+
+# Update pip and build tools
+echo -e "${GREEN}Updating build tools...${NC}"
+pip install --upgrade pip wheel setuptools build twine
+
+# Create source distribution
+echo -e "${GREEN}Creating source distribution...${NC}"
+python setup.py sdist
+
+# Create wheel distribution
+echo -e "${GREEN}Creating wheel distribution...${NC}"
+python setup.py bdist_wheel
+
+# Run tests
+echo -e "${GREEN}Running tests...${NC}"
+pytest tests/
+
+# Create documentation
+echo -e "${GREEN}Building documentation...${NC}"
+cd docs
+make html
+cd ..
+
+# Create distribution archive
+echo -e "${GREEN}Creating distribution archive...${NC}"
+VERSION=$(python setup.py --version)
+DIST_NAME="hft_trading_system-$VERSION"
+
+# Create dist directory if it doesn't exist
+mkdir -p dist
+
+# Create archive
+tar czf "dist/$DIST_NAME.tar.gz" \
+    --exclude=".git" \
+    --exclude="venv" \
+    --exclude="*.pyc" \
+    --exclude="__pycache__" \
+    --exclude="*.egg-info" \
+    --

@@ -1,0 +1,274 @@
+# Dockerfile
+FROM python:3.8-slim as build
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Run tests and build
+RUN python -m pytest tests/
+RUN python setup.py build
+
+# Production image
+FROM python:3.8-slim
+
+# Copy built application
+COPY --from=build /app /app
+WORKDIR /app
+
+# Create user
+RUN useradd -m hftuser && chown -R hftuser:hftuser /app
+USER hftuser
+
+# Command
+CMD ["python", "-m", "src.main"]
+
+---
+# docker-compose.yml
+version: '3.8'
+
+services:
+  hft_trading:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-hftuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-hftpass}
+      - POSTGRES_DB=${POSTGRES_DB:-hft_trading}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:6
+    command: redis-server --requirepass ${REDIS_PASSWORD:-hftredis}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+
+---
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hft-trading
+  namespace: trading
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hft-trading
+  template:
+    metadata:
+      labels:
+        app: hft-trading
+    spec:
+      containers:
+      - name: hft-trading
+        image: ${DOCKER_REGISTRY}/hft-trading:${VERSION}
+        resources:
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: hft-config
+              key: ENVIRONMENT
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: REDIS_URL
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: config
+        configMap:
+          name: hft-config
+      - name: logs
+        persistentVolumeClaim:
+          claimName: hft-logs-pvc
+
+---
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hft-trading
+  namespace: trading
+spec:
+  selector:
+    app: hft-trading
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+
+---
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hft-config
+  namespace: trading
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  MAX_POSITION_SIZE: "1000000"
+  RISK_CHECK_INTERVAL: "1"
+
+---
+# k8s/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hft-secrets
+  namespace: trading
+type: Opaque
+data:
+  DATABASE_URL: base64_encoded_url
+  REDIS_URL: base64_encoded_url
+
+---
+# k8s/storage.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hft-logs-pvc
+  namespace: trading
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# deploy.sh
+#!/bin/bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Default values
+ENVIRONMENT="development"
+VERSION="latest"
+DOCKER_REGISTRY="your-registry"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -e|--environment)
+            ENVIRONMENT="$2"
+            shift
+            shift
+            ;;
+        -v|--version)
+            VERSION="$2"
+            shift
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+echo -e "${BLUE}Deploying HFT Trading System...${NC}"
+echo "Environment: $ENVIRONMENT"
+echo "Version: $VERSION"
+
+# Load environment variables
+if [ -f ".env.$ENVIRONMENT" ]; then
+    source ".env.$ENVIRONMENT"
+else
+    echo -e "${RED}Environment file .env.$ENVIRONMENT not found${NC}"
+    exit 1
+fi
+
+# Build Docker image
+echo -e "${GREEN}Building Docker image...${NC}"
+docker build -t ${DOCKER_REGISTRY}/hft-trading:${VERSION} .
+
+# Push to registry
+echo -e "${GREEN}Pushing to registry...${NC}"
+docker push ${DOCKER_REGISTRY}/hft-trading:${VERSION}
+
+# Deploy to Kubernetes
+echo -e "${GREEN}Deploying to Kubernetes...${NC}"
+
+# Create namespace if it doesn't exist
+kubectl create namespace trading --dry-run=client -o yaml | kubectl apply -f -
+
+# Apply Kubernetes configurations
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/storage.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+
+# Wait for deployment
+echo -e "${GREEN}Waiting for deployment to complete...${NC}"
+kubectl rollout status deployment/hft-trading -n trading
+
+echo -e "${BLUE}Deployment completed successfully!${NC}"

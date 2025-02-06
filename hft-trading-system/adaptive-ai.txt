@@ -1,0 +1,313 @@
+[Previous code remains the same until _validate_trade]
+
+    async def _validate_trade(
+        self,
+        strategy: TradingStrategy,
+        signal: Dict
+    ) -> bool:
+        """Validate trading signal"""
+        # Check risk limits
+        if not self.risk_manager.check_order_risk(
+            signal['symbol'],
+            signal['side'],
+            self._calculate_position_size(strategy, signal),
+            self.market_data_manager.get_latest_price(signal['symbol'])
+        ):
+            return False
+        
+        # Check existing positions
+        if signal['symbol'] in self._active_trades:
+            return False
+        
+        # Validate signal confidence
+        if signal['confidence'] < strategy.confidence_threshold:
+            return False
+        
+        # Check market conditions
+        if not await self._validate_market_conditions(signal):
+            return False
+        
+        return True
+    
+    async def _execute_trade(
+        self,
+        strategy: TradingStrategy,
+        signal: Dict
+    ) -> Optional[str]:
+        """Execute trade based on signal"""
+        try:
+            # Calculate position size
+            position_size = self._calculate_position_size(strategy, signal)
+            
+            # Create order
+            order = await self.execution_engine.submit_order(
+                symbol=signal['symbol'],
+                side=signal['side'],
+                quantity=position_size,
+                order_type='MARKET',
+                stop_loss=signal['parameters']['stop_loss'],
+                take_profit=signal['parameters']['take_profit']
+            )
+            
+            if not order:
+                return None
+            
+            # Track trade
+            trade = {
+                'order_id': order.order_id,
+                'strategy_id': strategy.strategy_id,
+                'signal': signal,
+                'entry_time': datetime.utcnow(),
+                'entry_price': order.executed_price,
+                'position_size': position_size
+            }
+            
+            with self._lock:
+                self._active_trades[signal['symbol']] = trade
+            
+            self.logger.log_event(
+                "TRADE_EXECUTED",
+                f"Executed trade for strategy: {strategy.strategy_id}",
+                extra_data={
+                    "symbol": signal['symbol'],
+                    "side": signal['side'],
+                    "confidence": signal['confidence']
+                }
+            )
+            
+            return order.order_id
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                AdaptiveAIError(f"Trade execution failed: {str(e)}")
+            )
+            return None
+    
+    def _calculate_position_size(
+        self,
+        strategy: TradingStrategy,
+        signal: Dict
+    ) -> Decimal:
+        """Calculate position size based on strategy allocation"""
+        portfolio_value = self.risk_manager.get_portfolio_value()
+        strategy_allocation = self._strategy_allocations[strategy.strategy_id]
+        position_value = portfolio_value * strategy_allocation
+        
+        # Adjust for confidence
+        position_value *= Decimal(str(signal['confidence']))
+        
+        # Convert to quantity
+        price = self.market_data_manager.get_latest_price(signal['symbol'])
+        return position_value / price
+    
+    async def _validate_market_conditions(self, signal: Dict) -> bool:
+        """Validate current market conditions"""
+        try:
+            # Check trading hours
+            if not self.market_data_manager.is_market_open(signal['symbol']):
+                return False
+            
+            # Check liquidity
+            volume = await self.market_data_manager.get_recent_volume(signal['symbol'])
+            min_volume = self.config.get('min_volume_threshold', 1000)
+            if volume < min_volume:
+                return False
+            
+            # Check spread
+            spread = await self.market_data_manager.get_spread(signal['symbol'])
+            max_spread = self.config.get('max_spread_threshold', 0.001)
+            if spread > max_spread:
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def _should_adapt_strategy(self, strategy: TradingStrategy) -> bool:
+        """Determine if strategy should be adapted"""
+        # Check adaptation interval
+        if strategy.last_adapted:
+            min_interval = timedelta(
+                hours=self.config.get('adaptation_interval_hours', 24)
+            )
+            if datetime.utcnow() - strategy.last_adapted < min_interval:
+                return False
+        
+        # Check performance
+        performance = self._strategy_performance[strategy.strategy_id]
+        if not performance or len(performance) < self._adaptation_thresholds['min_trades']:
+            return False
+        
+        latest_perf = performance[-1]
+        
+        # Check performance thresholds
+        if (latest_perf.returns < self._adaptation_thresholds['min_performance'] or
+            latest_perf.max_drawdown > self._adaptation_thresholds['max_drawdown']):
+            return True
+        
+        return False
+    
+    async def _optimize_parameters(
+        self,
+        strategy: TradingStrategy,
+        performance: List[StrategyPerformance]
+    ) -> Dict[str, float]:
+        """Optimize strategy parameters"""
+        try:
+            # Get historical data
+            data = await self._get_optimization_data(strategy)
+            
+            # Initialize best parameters
+            best_params = strategy.parameters.copy()
+            best_sharpe = float('-inf')
+            
+            # Generate parameter combinations
+            param_combinations = self._generate_parameter_combinations()
+            
+            # Test each combination
+            for params in param_combinations:
+                sharpe = await self._backtest_parameters(
+                    strategy, params, data
+                )
+                if sharpe > best_sharpe:
+                    best_sharpe = sharpe
+                    best_params = params
+            
+            return best_params
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                AdaptiveAIError(f"Parameter optimization failed: {str(e)}")
+            )
+            return strategy.parameters
+    
+    def _generate_parameter_combinations(self) -> List[Dict[str, float]]:
+        """Generate parameter combinations for optimization"""
+        combinations = []
+        
+        # Generate grid of parameters
+        for _ in range(self.config.get('optimization_iterations', 50)):
+            params = {}
+            for param, (min_val, max_val) in self._parameter_ranges.items():
+                params[param] = min_val + (max_val - min_val) * np.random.random()
+            combinations.append(params)
+        
+        return combinations
+    
+    async def _backtest_parameters(
+        self,
+        strategy: TradingStrategy,
+        parameters: Dict[str, float],
+        data: pd.DataFrame
+    ) -> float:
+        """Backtest strategy parameters"""
+        try:
+            trades = []
+            position = None
+            
+            for i in range(len(data)):
+                if position is None:
+                    # Check for entry
+                    signal = self._check_entry_conditions(
+                        data.iloc[i],
+                        parameters
+                    )
+                    if signal:
+                        position = {
+                            'entry_price': data.iloc[i]['close'],
+                            'entry_time': data.iloc[i].name,
+                            'side': signal['side']
+                        }
+                else:
+                    # Check for exit
+                    exit_price = self._check_exit_conditions(
+                        data.iloc[i],
+                        position,
+                        parameters
+                    )
+                    if exit_price:
+                        trades.append({
+                            'entry_price': position['entry_price'],
+                            'exit_price': exit_price,
+                            'duration': (
+                                data.iloc[i].name - position['entry_time']
+                            ).total_seconds() / 3600,
+                            'return': (
+                                (exit_price - position['entry_price']) /
+                                position['entry_price']
+                            ) * (1 if position['side'] == 'BUY' else -1)
+                        })
+                        position = None
+            
+            return self._calculate_sharpe_ratio([t['return'] for t in trades])
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                AdaptiveAIError(f"Backtest failed: {str(e)}")
+            )
+            return float('-inf')
+    
+    def _calculate_sharpe_ratio(self, returns: List[float]) -> float:
+        """Calculate Sharpe ratio of returns"""
+        if not returns:
+            return float('-inf')
+        
+        returns = np.array(returns)
+        avg_return = np.mean(returns)
+        std_return = np.std(returns)
+        
+        if std_return == 0:
+            return float('-inf')
+            
+        return avg_return / std_return * np.sqrt(252)  # Annualized
+    
+    def _start_strategy_monitor(self) -> None:
+        """Start strategy monitoring thread"""
+        def monitor_thread():
+            while True:
+                try:
+                    self._update_strategy_performance()
+                    self._check_adaptation_needs()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        AdaptiveAIError(f"Strategy monitor failed: {str(e)}")
+                    )
+                time.sleep(300)  # Check every 5 minutes
+        
+        thread = threading.Thread(target=monitor_thread, daemon=True)
+        thread.start()
+    
+    def _update_strategy_performance(self) -> None:
+        """Update performance metrics for all strategies"""
+        for strategy_id, strategy in self._strategies.items():
+            try:
+                trades = self._get_strategy_trades(strategy_id)
+                if not trades:
+                    continue
+                
+                metrics = self._calculate_performance_metrics(trades)
+                
+                with self._lock:
+                    self._strategy_performance[strategy_id].append(metrics)
+                    strategy.performance_metrics = metrics.__dict__
+                    
+            except Exception as e:
+                self.error_handler.handle_error(
+                    AdaptiveAIError(f"Performance update failed: {str(e)}")
+                )
+    
+    def _check_adaptation_needs(self) -> None:
+        """Check if any strategies need adaptation"""
+        for strategy_id, strategy in self._strategies.items():
+            try:
+                if self._should_adapt_strategy(strategy):
+                    asyncio.create_task(self.adapt_strategy(strategy_id))
+            except Exception as e:
+                self.error_handler.handle_error(
+                    AdaptiveAIError(f"Adaptation check failed: {str(e)}")
+                )
+
+class AdaptiveAIError(Exception):
+    """Custom exception for adaptive AI errors"""
+    pass

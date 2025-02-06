@@ -1,0 +1,452 @@
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+from datetime import datetime, timedelta
+import threading
+import time
+import bisect
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+import matplotlib.pyplot as plt
+import io
+
+class LatencySource(Enum):
+    NETWORK = "network"
+    PROCESSING = "processing"
+    DATABASE = "database"
+    EXCHANGE = "exchange"
+    TOTAL = "total"
+
+@dataclass
+class LatencySample:
+    timestamp: datetime
+    source: LatencySource
+    latency_ns: int
+    operation: str
+    details: Dict
+
+@dataclass
+class LatencyStats:
+    mean_ns: float
+    median_ns: float
+    p95_ns: float
+    p99_ns: float
+    min_ns: int
+    max_ns: int
+    std_ns: float
+    sample_count: int
+
+class LatencyMonitor:
+    """Real-time latency monitoring and analysis"""
+    
+    def __init__(
+        self,
+        config: Dict,
+        logger,
+        error_handler
+    ):
+        self.config = config
+        self.logger = logger
+        self.error_handler = error_handler
+        
+        # Latency measurements
+        self._samples: Dict[LatencySource, deque] = {
+            source: deque(maxlen=10000)
+            for source in LatencySource
+        }
+        
+        # Threshold alerts
+        self._thresholds = {
+            LatencySource.NETWORK: 100_000,    # 100 microseconds
+            LatencySource.PROCESSING: 50_000,   # 50 microseconds
+            LatencySource.DATABASE: 200_000,    # 200 microseconds
+            LatencySource.EXCHANGE: 500_000,    # 500 microseconds
+            LatencySource.TOTAL: 1_000_000     # 1 millisecond
+        }
+        
+        # Performance tracking
+        self._baseline_stats: Dict[LatencySource, LatencyStats] = {}
+        self._current_stats: Dict[LatencySource, LatencyStats] = {}
+        
+        # Monitoring state
+        self._alert_count = 0
+        self._is_monitoring = False
+        self._lock = threading.Lock()
+        
+        # Initialize monitoring
+        self._start_monitoring()
+    
+    def record_latency(
+        self,
+        source: LatencySource,
+        latency_ns: int,
+        operation: str = "",
+        details: Optional[Dict] = None
+    ) -> None:
+        """Record a latency measurement"""
+        try:
+            sample = LatencySample(
+                timestamp=datetime.utcnow(),
+                source=source,
+                latency_ns=latency_ns,
+                operation=operation,
+                details=details or {}
+            )
+            
+            with self._lock:
+                self._samples[source].append(sample)
+                
+                # Check for threshold breach
+                if latency_ns > self._thresholds[source]:
+                    self._handle_threshold_breach(sample)
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Failed to record latency: {str(e)}")
+            )
+    
+    def get_latency_stats(
+        self,
+        source: Optional[LatencySource] = None,
+        window: Optional[timedelta] = None
+    ) -> Dict[LatencySource, LatencyStats]:
+        """Get latency statistics"""
+        try:
+            stats = {}
+            sources = [source] if source else LatencySource
+            
+            for src in sources:
+                samples = self._get_samples(src, window)
+                if samples:
+                    latencies = [s.latency_ns for s in samples]
+                    stats[src] = LatencyStats(
+                        mean_ns=float(np.mean(latencies)),
+                        median_ns=float(np.median(latencies)),
+                        p95_ns=float(np.percentile(latencies, 95)),
+                        p99_ns=float(np.percentile(latencies, 99)),
+                        min_ns=int(np.min(latencies)),
+                        max_ns=int(np.max(latencies)),
+                        std_ns=float(np.std(latencies)),
+                        sample_count=len(latencies)
+                    )
+            
+            return stats
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Failed to get latency stats: {str(e)}")
+            )
+            return {}
+    
+    def generate_latency_report(self) -> Dict:
+        """Generate comprehensive latency report"""
+        try:
+            report = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'summary': self._generate_summary(),
+                'details': self._generate_details(),
+                'alerts': self._generate_alerts(),
+                'recommendations': self._generate_recommendations()
+            }
+            
+            # Add visualization
+            report['visualizations'] = {
+                'histogram': self._generate_histogram(),
+                'timeline': self._generate_timeline(),
+                'heatmap': self._generate_heatmap()
+            }
+            
+            return report
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Failed to generate report: {str(e)}")
+            )
+            return {}
+    
+    def _start_monitoring(self) -> None:
+        """Start latency monitoring"""
+        def monitor():
+            while self._is_monitoring:
+                try:
+                    self._update_statistics()
+                    self._check_anomalies()
+                    time.sleep(1)
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        LatencyError(f"Monitoring failed: {str(e)}")
+                    )
+        
+        self._is_monitoring = True
+        threading.Thread(target=monitor, daemon=True).start()
+    
+    def _get_samples(
+        self,
+        source: LatencySource,
+        window: Optional[timedelta] = None
+    ) -> List[LatencySample]:
+        """Get latency samples for specified source and time window"""
+        try:
+            with self._lock:
+                samples = list(self._samples[source])
+            
+            if window:
+                cutoff = datetime.utcnow() - window
+                samples = [s for s in samples if s.timestamp >= cutoff]
+            
+            return samples
+            
+        except Exception:
+            return []
+    
+    def _update_statistics(self) -> None:
+        """Update current latency statistics"""
+        try:
+            current_stats = self.get_latency_stats()
+            
+            with self._lock:
+                self._current_stats = current_stats
+                
+                # Update baseline if not set
+                if not self._baseline_stats:
+                    self._baseline_stats = current_stats
+                    
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Stats update failed: {str(e)}")
+            )
+    
+    def _check_anomalies(self) -> None:
+        """Check for latency anomalies"""
+        try:
+            if not self._baseline_stats:
+                return
+                
+            for source in LatencySource:
+                if (source in self._current_stats and 
+                    source in self._baseline_stats):
+                    current = self._current_stats[source]
+                    baseline = self._baseline_stats[source]
+                    
+                    # Check for significant deviation
+                    if (current.mean_ns > baseline.mean_ns * 1.5 or
+                        current.p99_ns > baseline.p99_ns * 2):
+                        self._handle_anomaly(source, current, baseline)
+                        
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Anomaly check failed: {str(e)}")
+            )
+    
+    def _handle_threshold_breach(self, sample: LatencySample) -> None:
+        """Handle latency threshold breach"""
+        try:
+            self._alert_count += 1
+            
+            self.logger.log_event(
+                "LATENCY_ALERT",
+                f"Latency threshold breached for {sample.source.value}",
+                level="WARNING",
+                extra_data={
+                    'latency_ns': sample.latency_ns,
+                    'threshold_ns': self._thresholds[sample.source],
+                    'operation': sample.operation,
+                    'details': sample.details
+                }
+            )
+            
+            # Take action if too many breaches
+            if self._alert_count > self.config.get('max_alerts', 100):
+                self._trigger_emergency_procedures()
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Alert handling failed: {str(e)}")
+            )
+    
+    def _handle_anomaly(
+        self,
+        source: LatencySource,
+        current: LatencyStats,
+        baseline: LatencyStats
+    ) -> None:
+        """Handle latency anomaly"""
+        try:
+            increase = (current.mean_ns - baseline.mean_ns) / baseline.mean_ns * 100
+            
+            self.logger.log_event(
+                "LATENCY_ANOMALY",
+                f"Latency anomaly detected for {source.value}",
+                level="WARNING",
+                extra_data={
+                    'increase_percent': increase,
+                    'current_mean': current.mean_ns,
+                    'baseline_mean': baseline.mean_ns
+                }
+            )
+            
+            # Analyze root cause
+            root_cause = self._analyze_root_cause(source)
+            if root_cause:
+                self._trigger_optimization(source, root_cause)
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Anomaly handling failed: {str(e)}")
+            )
+    
+    def _analyze_root_cause(self, source: LatencySource) -> Optional[str]:
+        """Analyze root cause of latency anomaly"""
+        try:
+            samples = self._get_samples(source, timedelta(minutes=5))
+            if not samples:
+                return None
+                
+            # Analyze patterns
+            patterns = {
+                'network_congestion': self._check_network_congestion(samples),
+                'processing_overload': self._check_processing_overload(samples),
+                'resource_contention': self._check_resource_contention(samples),
+                'external_factors': self._check_external_factors(samples)
+            }
+            
+            # Return most likely cause
+            return max(patterns.items(), key=lambda x: x[1])[0]
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Root cause analysis failed: {str(e)}")
+            )
+            return None
+    
+    def _trigger_optimization(
+        self,
+        source: LatencySource,
+        root_cause: str
+    ) -> None:
+        """Trigger automatic optimization"""
+        try:
+            optimizations = {
+                'network_congestion': self._optimize_network,
+                'processing_overload': self._optimize_processing,
+                'resource_contention': self._optimize_resources,
+                'external_factors': self._optimize_external
+            }
+            
+            if root_cause in optimizations:
+                optimization_func = optimizations[root_cause]
+                threading.Thread(
+                    target=optimization_func,
+                    args=(source,),
+                    daemon=True
+                ).start()
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Optimization trigger failed: {str(e)}")
+            )
+    
+    def _optimize_network(self, source: LatencySource) -> None:
+        """Optimize network performance"""
+        try:
+            # Adjust buffer sizes
+            self._adjust_socket_buffers()
+            
+            # Update routing
+            self._optimize_routing()
+            
+            # Adjust TCP parameters
+            self._optimize_tcp_params()
+            
+            self.logger.log_event(
+                "NETWORK_OPTIMIZATION",
+                "Applied network optimizations"
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Network optimization failed: {str(e)}")
+            )
+    
+    def _optimize_processing(self, source: LatencySource) -> None:
+        """Optimize processing performance"""
+        try:
+            # Adjust thread priorities
+            self._adjust_thread_priorities()
+            
+            # Optimize CPU affinity
+            self._optimize_cpu_affinity()
+            
+            # Adjust batch sizes
+            self._optimize_batch_sizes()
+            
+            self.logger.log_event(
+                "PROCESSING_OPTIMIZATION",
+                "Applied processing optimizations"
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Processing optimization failed: {str(e)}")
+            )
+    
+    def _optimize_resources(self, source: LatencySource) -> None:
+        """Optimize resource utilization"""
+        try:
+            # Check memory usage
+            self._optimize_memory()
+            
+            # Adjust cache settings
+            self._optimize_cache()
+            
+            # Optimize I/O patterns
+            self._optimize_io()
+            
+            self.logger.log_event(
+                "RESOURCE_OPTIMIZATION",
+                "Applied resource optimizations"
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Resource optimization failed: {str(e)}")
+            )
+    
+    def _generate_histogram(self) -> bytes:
+        """Generate latency histogram"""
+        try:
+            plt.figure(figsize=(10, 6))
+            
+            for source in LatencySource:
+                samples = self._get_samples(source)
+                if samples:
+                    latencies = [s.latency_ns / 1000 for s in samples]  # Convert to microseconds
+                    plt.hist(
+                        latencies,
+                        bins=50,
+                        alpha=0.5,
+                        label=source.value
+                    )
+            
+            plt.xlabel('Latency (μs)')
+            plt.ylabel('Frequency')
+            plt.title('Latency Distribution')
+            plt.legend()
+            plt.grid(True)
+            
+            # Save plot to bytes
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            plt.close()
+            
+            return buf.getvalue()
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                LatencyError(f"Histogram generation failed: {str(e)}")
+            )
+            return b""
+
+class LatencyError(Exception):
+    """Custom exception for latency-related errors"""
+    pass

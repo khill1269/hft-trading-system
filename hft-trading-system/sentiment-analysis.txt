@@ -1,0 +1,139 @@
+# [Previous code remains the same until _start_sentiment_updater]
+
+    def _start_sentiment_updater(self) -> None:
+        """Start sentiment updating thread"""
+        def updater_thread():
+            while True:
+                try:
+                    self._update_all_sentiment()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        SentimentAnalysisError(f"Sentiment update failed: {str(e)}")
+                    )
+                time.sleep(60)  # Update every minute
+        
+        thread = threading.Thread(target=updater_thread, daemon=True)
+        thread.start()
+    
+    def _update_all_sentiment(self) -> None:
+        """Update sentiment for all tracked symbols"""
+        with self._lock:
+            for symbol in self._sentiment_signals.keys():
+                # Update market data sentiment
+                market_sentiment = asyncio.run(self.analyze_market_data(symbol))
+                if market_sentiment:
+                    self._add_sentiment_signal(market_sentiment)
+                
+                # Update technical sentiment
+                tech_sentiment = asyncio.run(self.analyze_technical_indicators(symbol))
+                if tech_sentiment:
+                    self._add_sentiment_signal(tech_sentiment)
+                
+                # Aggregate updated sentiment
+                self._aggregate_sentiment(symbol)
+    
+    def _add_sentiment_signal(self, signal: SentimentSignal) -> None:
+        """Add new sentiment signal"""
+        if signal.symbol not in self._sentiment_signals:
+            self._sentiment_signals[signal.symbol] = []
+        
+        # Add new signal
+        self._sentiment_signals[signal.symbol].append(signal)
+        
+        # Remove old signals
+        cutoff_time = datetime.utcnow() - timedelta(days=1)
+        self._sentiment_signals[signal.symbol] = [
+            s for s in self._sentiment_signals[signal.symbol]
+            if s.timestamp > cutoff_time
+        ]
+        
+        # Log significant sentiment changes
+        self._log_sentiment_change(signal)
+    
+    def _log_sentiment_change(self, signal: SentimentSignal) -> None:
+        """Log significant changes in sentiment"""
+        # Get previous signal for same source
+        previous_signals = [
+            s for s in self._sentiment_signals[signal.symbol]
+            if s.source == signal.source and s.timestamp < signal.timestamp
+        ]
+        
+        if not previous_signals:
+            return
+        
+        previous_signal = max(previous_signals, key=lambda x: x.timestamp)
+        
+        # Check for significant change
+        if abs(signal.raw_score - previous_signal.raw_score) > 0.3:
+            self.logger.log_event(
+                "SENTIMENT_CHANGE",
+                f"Significant sentiment change for {signal.symbol}",
+                level="WARNING",
+                extra_data={
+                    "source": signal.source.value,
+                    "old_sentiment": previous_signal.sentiment_level.value,
+                    "new_sentiment": signal.sentiment_level.value,
+                    "confidence": signal.confidence
+                }
+            )
+    
+    def _create_single_source_sentiment(
+        self,
+        signal: SentimentSignal
+    ) -> AggregatedSentiment:
+        """Create sentiment object from single source"""
+        return AggregatedSentiment(
+            symbol=signal.symbol,
+            timestamp=signal.timestamp,
+            overall_sentiment=signal.sentiment_level,
+            confidence=signal.confidence,
+            components={signal.source: signal},
+            trend="STABLE",
+            volume_weighted_score=signal.raw_score,
+            key_drivers=signal.keywords
+        )
+    
+    async def get_sentiment_history(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime
+    ) -> List[AggregatedSentiment]:
+        """Get historical sentiment data"""
+        try:
+            with self._lock:
+                signals = self._sentiment_signals.get(symbol, [])
+                filtered_signals = [
+                    s for s in signals
+                    if start_time <= s.timestamp <= end_time
+                ]
+                
+                # Group signals by hour
+                hour_groups = {}
+                for signal in filtered_signals:
+                    hour_key = signal.timestamp.replace(
+                        minute=0, second=0, microsecond=0
+                    )
+                    if hour_key not in hour_groups:
+                        hour_groups[hour_key] = []
+                    hour_groups[hour_key].append(signal)
+                
+                # Create aggregated sentiment for each hour
+                history = []
+                for timestamp, hour_signals in sorted(hour_groups.items()):
+                    self._sentiment_signals[symbol] = hour_signals
+                    self._aggregate_sentiment(symbol)
+                    if symbol in self._aggregated_sentiment:
+                        history.append(self._aggregated_sentiment[symbol])
+                
+                return history
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                SentimentAnalysisError(f"Failed to get sentiment history: {str(e)}")
+            )
+            return []
+
+class SentimentAnalysisError(Exception):
+    """Custom exception for sentiment analysis errors"""
+    pass

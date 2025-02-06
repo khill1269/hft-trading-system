@@ -1,0 +1,287 @@
+from typing import List, Dict, Optional
+from decimal import Decimal
+from datetime import datetime, timedelta
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class PriceStats:
+    """Statistical information about price data"""
+    mean: Decimal
+    median: Decimal
+    std_dev: Decimal
+    min_price: Decimal
+    max_price: Decimal
+    price_range: Decimal
+    volume_weighted_avg: Decimal
+
+class MarketDataAnalytics:
+    """Analytics utilities for market data"""
+    
+    @staticmethod
+    def calculate_vwap(prices: List[Decimal], volumes: List[Decimal]) -> Decimal:
+        """Calculate Volume Weighted Average Price"""
+        if not prices or not volumes or len(prices) != len(volumes):
+            raise ValueError("Invalid price/volume data")
+            
+        total_volume = sum(volumes)
+        if total_volume == 0:
+            return Decimal('0')
+            
+        weighted_sum = sum(p * v for p, v in zip(prices, volumes))
+        return weighted_sum / total_volume
+    
+    @staticmethod
+    def calculate_price_stats(
+        prices: List[Decimal],
+        volumes: List[Decimal]
+    ) -> PriceStats:
+        """Calculate various price statistics"""
+        if not prices:
+            raise ValueError("No price data provided")
+            
+        # Convert to numpy arrays for efficient calculation
+        price_array = np.array([float(p) for p in prices])
+        
+        return PriceStats(
+            mean=Decimal(str(np.mean(price_array))),
+            median=Decimal(str(np.median(price_array))),
+            std_dev=Decimal(str(np.std(price_array))),
+            min_price=Decimal(str(np.min(price_array))),
+            max_price=Decimal(str(np.max(price_array))),
+            price_range=Decimal(str(np.ptp(price_array))),
+            volume_weighted_avg=MarketDataAnalytics.calculate_vwap(prices, volumes)
+        )
+    
+    @staticmethod
+    def calculate_returns(prices: List[Decimal]) -> List[Decimal]:
+        """Calculate price returns"""
+        if len(prices) < 2:
+            return []
+            
+        returns = []
+        for i in range(1, len(prices)):
+            if prices[i-1] == 0:
+                returns.append(Decimal('0'))
+            else:
+                ret = (prices[i] - prices[i-1]) / prices[i-1]
+                returns.append(ret)
+        
+        return returns
+    
+    @staticmethod
+    def detect_anomalies(
+        prices: List[Decimal],
+        std_dev_threshold: float = 3.0
+    ) -> List[int]:
+        """Detect price anomalies using z-score"""
+        if len(prices) < 2:
+            return []
+            
+        price_array = np.array([float(p) for p in prices])
+        mean = np.mean(price_array)
+        std = np.std(price_array)
+        
+        z_scores = np.abs((price_array - mean) / std)
+        
+        return [i for i, z in enumerate(z_scores) if z > std_dev_threshold]
+
+class MarketDataNormalizer:
+    """Utilities for normalizing market data"""
+    
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        """Normalize symbol format"""
+        return symbol.upper().strip()
+    
+    @staticmethod
+    def normalize_price(
+        price: Decimal,
+        tick_size: Decimal
+    ) -> Decimal:
+        """Normalize price to valid tick size"""
+        return Decimal(round(float(price) / float(tick_size)) * float(tick_size))
+    
+    @staticmethod
+    def normalize_volume(
+        volume: Decimal,
+        lot_size: Decimal
+    ) -> Decimal:
+        """Normalize volume to valid lot size"""
+        return Decimal(round(float(volume) / float(lot_size)) * float(lot_size))
+
+class TimeSeriesAnalysis:
+    """Time series analysis utilities"""
+    
+    @staticmethod
+    def calculate_moving_average(
+        prices: List[Decimal],
+        window: int
+    ) -> List[Decimal]:
+        """Calculate simple moving average"""
+        if len(prices) < window:
+            return []
+            
+        price_array = np.array([float(p) for p in prices])
+        ma = np.convolve(price_array, np.ones(window), 'valid') / window
+        
+        return [Decimal(str(x)) for x in ma]
+    
+    @staticmethod
+    def calculate_exponential_ma(
+        prices: List[Decimal],
+        span: int
+    ) -> List[Decimal]:
+        """Calculate exponential moving average"""
+        if not prices:
+            return []
+            
+        price_array = np.array([float(p) for p in prices])
+        alpha = 2.0 / (span + 1)
+        
+        ema = np.zeros_like(price_array)
+        ema[0] = price_array[0]
+        
+        for i in range(1, len(price_array)):
+            ema[i] = alpha * price_array[i] + (1 - alpha) * ema[i-1]
+        
+        return [Decimal(str(x)) for x in ema]
+    
+    @staticmethod
+    def calculate_volatility(
+        returns: List[Decimal],
+        window: int
+    ) -> List[Decimal]:
+        """Calculate rolling volatility"""
+        if len(returns) < window:
+            return []
+            
+        returns_array = np.array([float(r) for r in returns])
+        vol = np.zeros(len(returns_array) - window + 1)
+        
+        for i in range(len(vol)):
+            vol[i] = np.std(returns_array[i:i+window]) * np.sqrt(252)  # Annualized
+            
+        return [Decimal(str(x)) for x in vol]
+    
+    @staticmethod
+    def calculate_bollinger_bands(
+        prices: List[Decimal],
+        window: int,
+        num_std: float = 2.0
+    ) -> tuple[List[Decimal], List[Decimal], List[Decimal]]:
+        """Calculate Bollinger Bands"""
+        if len(prices) < window:
+            return [], [], []
+            
+        price_array = np.array([float(p) for p in prices])
+        
+        # Calculate middle band (SMA)
+        middle_band = np.convolve(price_array, np.ones(window), 'valid') / window
+        
+        # Calculate standard deviation
+        std_dev = np.array([np.std(price_array[i:i+window]) 
+                           for i in range(len(price_array) - window + 1)])
+        
+        # Calculate upper and lower bands
+        upper_band = middle_band + (std_dev * num_std)
+        lower_band = middle_band - (std_dev * num_std)
+        
+        return (
+            [Decimal(str(x)) for x in lower_band],
+            [Decimal(str(x)) for x in middle_band],
+            [Decimal(str(x)) for x in upper_band]
+        )
+    
+    @staticmethod
+    def calculate_momentum(
+        prices: List[Decimal],
+        period: int
+    ) -> List[Decimal]:
+        """Calculate momentum indicator"""
+        if len(prices) <= period:
+            return []
+            
+        price_array = np.array([float(p) for p in prices])
+        momentum = np.zeros(len(price_array) - period)
+        
+        for i in range(len(momentum)):
+            momentum[i] = price_array[i + period] / price_array[i] - 1
+            
+        return [Decimal(str(x)) for x in momentum]
+    
+    @staticmethod
+    def calculate_rsi(
+        prices: List[Decimal],
+        period: int = 14
+    ) -> List[Decimal]:
+        """Calculate Relative Strength Index"""
+        if len(prices) <= period:
+            return []
+            
+        price_array = np.array([float(p) for p in prices])
+        deltas = np.diff(price_array)
+        
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.zeros_like(price_array)
+        avg_loss = np.zeros_like(price_array)
+        
+        # First average gain and loss
+        avg_gain[period] = np.mean(gains[:period])
+        avg_loss[period] = np.mean(losses[:period])
+        
+        # Calculate subsequent values
+        for i in range(period + 1, len(price_array)):
+            avg_gain[i] = (avg_gain[i-1] * (period - 1) + gains[i-1]) / period
+            avg_loss[i] = (avg_loss[i-1] * (period - 1) + losses[i-1]) / period
+        
+        rs = avg_gain[period:] / avg_loss[period:]
+        rsi = 100 - (100 / (1 + rs))
+        
+        return [Decimal(str(x)) for x in rsi]
+
+class MarketDataAggregator:
+    """Utilities for aggregating market data"""
+    
+    @staticmethod
+    def aggregate_ticks_by_time(
+        ticks: List['MarketTick'],
+        interval: timedelta
+    ) -> List[Dict]:
+        """Aggregate tick data into OHLCV bars"""
+        if not ticks:
+            return []
+        
+        # Sort ticks by timestamp
+        sorted_ticks = sorted(ticks, key=lambda x: x.timestamp)
+        
+        bars = []
+        current_bar = None
+        
+        for tick in sorted_ticks:
+            bar_time = tick.timestamp - (tick.timestamp - datetime.min) % interval
+            
+            if current_bar is None or bar_time > current_bar['timestamp']:
+                if current_bar is not None:
+                    bars.append(current_bar)
+                
+                current_bar = {
+                    'timestamp': bar_time,
+                    'open': tick.price,
+                    'high': tick.price,
+                    'low': tick.price,
+                    'close': tick.price,
+                    'volume': tick.volume
+                }
+            else:
+                current_bar['high'] = max(current_bar['high'], tick.price)
+                current_bar['low'] = min(current_bar['low'], tick.price)
+                current_bar['close'] = tick.price
+                current_bar['volume'] += tick.volume
+        
+        if current_bar is not None:
+            bars.append(current_bar)
+        
+        return bars

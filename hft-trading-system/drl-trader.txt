@@ -1,0 +1,155 @@
+[Previous code remains the same until train function]
+
+    def train(self, num_episodes: int) -> None:
+        """Train the agent"""
+        try:
+            for episode in range(num_episodes):
+                state = self.env.reset()
+                self.episode_reward = 0
+                done = False
+                
+                while not done:
+                    # Select action
+                    action = self.select_action(state)
+                    
+                    # Execute action
+                    next_state, reward, done, _ = self.env.step(action)
+                    
+                    # Store experience
+                    experience = Experience(
+                        state, action, reward, next_state, done
+                    )
+                    self.replay_buffer.add(experience)
+                    
+                    # Update networks
+                    if len(self.replay_buffer) > self.batch_size:
+                        self._update_networks()
+                    
+                    # Update state and reward
+                    state = next_state
+                    self.episode_reward += reward
+                    self.total_steps += 1
+                
+                # Log episode results
+                self.logger.log_event(
+                    "DRL_TRAINING",
+                    f"Episode {episode} completed",
+                    extra_data={
+                        "reward": self.episode_reward,
+                        "steps": self.total_steps
+                    }
+                )
+                
+                # Save best model
+                if self.episode_reward > self.best_reward:
+                    self.best_reward = self.episode_reward
+                    self._save_models()
+                    
+        except Exception as e:
+            self.error_handler.handle_error(
+                DRLTraderError(f"Training failed: {str(e)}")
+            )
+    
+    def _update_networks(self) -> None:
+        """Update actor and critic networks"""
+        # Sample batch of experiences
+        states, actions, rewards, next_states, dones = \
+            self.replay_buffer.sample(self.batch_size)
+        
+        # Update critic
+        with torch.no_grad():
+            next_actions = self.actor_target(next_states)
+            next_q_values = self.critic_target(next_states, next_actions)
+            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        
+        current_q_values = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(current_q_values, target_q_values)
+        
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        # Update actor
+        actor_loss = -self.critic(states, self.actor(states)).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        
+        # Update target networks
+        self._soft_update(self.actor_target, self.actor)
+        self._soft_update(self.critic_target, self.critic)
+    
+    def _soft_update(
+        self,
+        target: nn.Module,
+        source: nn.Module
+    ) -> None:
+        """Soft update target network parameters"""
+        for target_param, param in zip(
+            target.parameters(), source.parameters()
+        ):
+            target_param.data.copy_(
+                target_param.data * (1.0 - self.tau) + 
+                param.data * self.tau
+            )
+    
+    def _hard_update(
+        self,
+        target: nn.Module,
+        source: nn.Module
+    ) -> None:
+        """Hard update target network parameters"""
+        for target_param, param in zip(
+            target.parameters(), source.parameters()
+        ):
+            target_param.data.copy_(param.data)
+    
+    def _save_models(self) -> None:
+        """Save model parameters"""
+        try:
+            torch.save(
+                self.actor.state_dict(),
+                f"models/drl_actor_{self.total_steps}.pth"
+            )
+            torch.save(
+                self.critic.state_dict(),
+                f"models/drl_critic_{self.total_steps}.pth"
+            )
+        except Exception as e:
+            self.error_handler.handle_error(
+                DRLTraderError(f"Failed to save models: {str(e)}")
+            )
+    
+    def _load_models(self, actor_path: str, critic_path: str) -> None:
+        """Load model parameters"""
+        try:
+            self.actor.load_state_dict(torch.load(actor_path))
+            self.critic.load_state_dict(torch.load(critic_path))
+            self._hard_update(self.actor_target, self.actor)
+            self._hard_update(self.critic_target, self.critic)
+        except Exception as e:
+            self.error_handler.handle_error(
+                DRLTraderError(f"Failed to load models: {str(e)}")
+            )
+    
+    def _start_training(self) -> None:
+        """Start training thread"""
+        def training_thread():
+            while True:
+                try:
+                    # Check if enough data in buffer
+                    if len(self.replay_buffer) > self.batch_size:
+                        self._update_networks()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        DRLTraderError(f"Training thread failed: {str(e)}")
+                    )
+                time.sleep(1)
+        
+        thread = threading.Thread(target=training_thread, daemon=True)
+        thread.start()
+
+class DRLTraderError(Exception):
+    """Custom exception for DRL trader errors"""
+    pass

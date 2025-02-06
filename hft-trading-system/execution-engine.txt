@@ -1,0 +1,231 @@
+"""
+Ultra-low latency execution engine with FPGA acceleration
+"""
+from typing import Dict, Optional, List, Tuple
+from decimal import Decimal
+from datetime import datetime
+import asyncio
+import struct
+from dataclasses import dataclass
+from enum import Enum
+
+class OrderType(Enum):
+    MARKET = 1
+    LIMIT = 2
+    IOC = 3
+    FOK = 4
+
+class OrderStatus(Enum):
+    NEW = 1
+    ACCEPTED = 2
+    REJECTED = 3
+    FILLED = 4
+    PARTIAL = 5
+    CANCELLED = 6
+
+@dataclass
+class Order:
+    order_id: str
+    symbol: str
+    side: str
+    order_type: OrderType
+    quantity: Decimal
+    price: Optional[Decimal]
+    status: OrderStatus
+    timestamp: int  # nanoseconds
+    flags: int = 0
+
+class ExecutionEngine:
+    """High-performance execution engine"""
+    
+    def __init__(
+        self,
+        config: Dict,
+        fpga_manager: Optional['FPGAManager'] = None,
+        risk_manager: Optional['RiskManager'] = None,
+        logger = None
+    ):
+        self.config = config
+        self.fpga_manager = fpga_manager
+        self.risk_manager = risk_manager
+        self.logger = logger
+        
+        # Order management
+        self.active_orders: Dict[str, Order] = {}
+        self.order_history: Dict[str, List[Order]] = {}
+        
+        # Performance tracking
+        self._execution_times = []
+        self._sequence_number = 0
+        self._is_running = False
+
+    async def start(self) -> None:
+        """Start execution engine"""
+        if self._is_running:
+            return
+            
+        self._is_running = True
+        
+        # Initialize FPGA if available
+        if self.fpga_manager:
+            await self._init_fpga()
+        
+        # Start processing
+        asyncio.create_task(self._process_executions())
+        if self.fpga_manager:
+            asyncio.create_task(self._process_fpga_executions())
+
+    async def submit_order(self, order: Order) -> bool:
+        """Submit order for execution"""
+        try:
+            start_time = datetime.utcnow()
+            
+            # Validate order
+            if not self._validate_order(order):
+                return False
+            
+            # Check risk limits
+            if self.risk_manager and not await self.risk_manager.check_order(order):
+                return False
+            
+            # Submit order
+            success = False
+            if self.fpga_manager and self._can_use_fpga(order):
+                success = await self._submit_fpga_order(order)
+            else:
+                success = await self._submit_software_order(order)
+            
+            # Track execution time
+            execution_time = (datetime.utcnow() - start_time).total_seconds() * 1_000_000  # μs
+            self._execution_times.append(execution_time)
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"Order submission failed: {e}")
+            return False
+
+    async def _init_fpga(self) -> None:
+        """Initialize FPGA for order execution"""
+        try:
+            # Configure FPGA
+            await self.fpga_manager.configure_execution({
+                'buffer_size': self.config.get('fpga_buffer_size', 1024*1024),
+                'mode': 'execution'
+            })
+            
+            # Set up DMA buffers
+            await self.fpga_manager.setup_dma_buffers()
+            
+        except Exception as e:
+            self.logger.error(f"FPGA initialization failed: {e}")
+            raise
+
+    def _can_use_fpga(self, order: Order) -> bool:
+        """Check if order can use FPGA execution"""
+        if not self.fpga_manager:
+            return False
+            
+        # Check order type compatibility
+        fpga_types = {OrderType.MARKET, OrderType.IOC}
+        if order.order_type not in fpga_types:
+            return False
+            
+        # Check size limits
+        max_size = self.config.get('max_fpga_order_size', 100000)
+        if order.quantity > max_size:
+            return False
+        
+        return True
+
+    async def _submit_fpga_order(self, order: Order) -> bool:
+        """Submit order via FPGA"""
+        try:
+            # Pack order data
+            order_data = struct.pack(
+                'Q32sQdII',  # id(8), symbol(32), quantity(8), price(8), type(4), flags(4)
+                int(order.order_id),
+                order.symbol.encode(),
+                int(order.quantity),
+                float(order.price or 0),
+                order.order_type.value,
+                order.flags
+            )
+            
+            # Send to FPGA
+            success = await self.fpga_manager.submit_order(order_data)
+            if success:
+                self.active_orders[order.order_id] = order
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"FPGA order submission failed: {e}")
+            return False
+
+    async def _submit_software_order(self, order: Order) -> bool:
+        """Submit order via software pathway"""
+        try:
+            # Implement standard order submission
+            self.active_orders[order.order_id] = order
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Software order submission failed: {e}")
+            return False
+
+    async def _process_executions(self) -> None:
+        """Process order executions"""
+        while self._is_running:
+            try:
+                # Process executions
+                await asyncio.sleep(0)
+                
+            except Exception as e:
+                self.logger.error(f"Execution processing error: {e}")
+
+    async def _process_fpga_executions(self) -> None:
+        """Process FPGA executions"""
+        while self._is_running:
+            try:
+                # Read from FPGA
+                data = await self.fpga_manager.read_execution_data()
+                if data:
+                    await self._handle_fpga_execution(data)
+                
+                await asyncio.sleep(0)
+                
+            except Exception as e:
+                self.logger.error(f"FPGA execution processing error: {e}")
+
+    async def _handle_fpga_execution(self, data: bytes) -> None:
+        """Handle execution from FPGA"""
+        try:
+            # Unpack execution data
+            order_id, timestamp, filled_qty, price = struct.unpack('QQdQ', data)
+            
+            # Update order
+            if str(order_id) in self.active_orders:
+                order = self.active_orders[str(order_id)]
+                order.status = OrderStatus.FILLED
+                
+                # Notify risk manager
+                if self.risk_manager:
+                    await self.risk_manager.update_position(order)
+                
+        except Exception as e:
+            self.logger.error(f"FPGA execution handling failed: {e}")
+
+    def get_statistics(self) -> Dict:
+        """Get execution statistics"""
+        if not self._execution_times:
+            return {}
+            
+        return {
+            'total_orders': len(self.active_orders) + len(self.order_history),
+            'average_latency_us': np.mean(self._execution_times),
+            'p99_latency_us': np.percentile(self._execution_times, 99),
+            'min_latency_us': np.min(self._execution_times),
+            'max_latency_us': np.max(self._execution_times),
+            'fpga_usage': len([o for o in self.active_orders.values() if o.flags & 0x1]) / max(len(self.active_orders), 1)
+        }

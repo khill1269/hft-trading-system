@@ -1,0 +1,186 @@
+            # Run QAOA
+            result = self.qaoa.compute_minimum_eigenvalue(qubit_op)
+            
+            # Extract optimal execution schedule
+            schedule = self._extract_execution_schedule(result.eigenstate)
+            
+            # Calculate execution metrics
+            metrics = self._calculate_execution_metrics(
+                schedule,
+                market_impact,
+                volume_profile
+            )
+            
+            return {
+                'schedule': schedule.tolist(),
+                'expected_cost': metrics['cost'],
+                'market_impact': metrics['impact'],
+                'timing_score': metrics['timing']
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Execution optimization failed: {str(e)}")
+            return {}
+
+    def run_circuit(
+        self,
+        circuit: QuantumCircuit,
+        parameters: Dict[Parameter, float]
+    ) -> np.ndarray:
+        """Run quantum circuit with parameters"""
+        try:
+            # Bind parameters
+            bound_circuit = circuit.bind_parameters(parameters)
+            
+            # Execute circuit
+            job = self.backend.run(
+                bound_circuit,
+                shots=self.shots
+            )
+            result = job.result()
+            
+            # Process results
+            counts = result.get_counts()
+            return self._process_quantum_results(counts)
+            
+        except Exception as e:
+            self.logger.error(f"Circuit execution failed: {str(e)}")
+            return np.zeros(circuit.num_qubits)
+
+    def _prepare_portfolio_operator(
+        self,
+        returns: np.ndarray,
+        constraints: Dict
+    ) -> 'Operator':
+        """Prepare quantum operator for portfolio optimization"""
+        try:
+            from qiskit.opflow import PauliSumOp
+            
+            # Calculate covariance matrix
+            cov_matrix = np.cov(returns.T)
+            
+            # Prepare Hamiltonian
+            n_assets = len(returns)
+            hamiltonian = np.zeros((2**n_assets, 2**n_assets))
+            
+            # Add return maximization term
+            expected_returns = np.mean(returns, axis=0)
+            hamiltonian += self._create_return_term(expected_returns)
+            
+            # Add risk minimization term
+            risk_weight = constraints.get('risk_weight', 1.0)
+            hamiltonian += risk_weight * self._create_risk_term(cov_matrix)
+            
+            # Add constraints
+            if 'max_weight' in constraints:
+                hamiltonian += self._add_weight_constraint(
+                    n_assets,
+                    constraints['max_weight']
+                )
+            
+            return PauliSumOp.from_matrix(hamiltonian)
+            
+        except Exception as e:
+            self.logger.error(f"Operator preparation failed: {str(e)}")
+            raise
+
+    def _prepare_execution_operator(
+        self,
+        market_impact: np.ndarray,
+        volume_profile: np.ndarray
+    ) -> 'Operator':
+        """Prepare quantum operator for execution optimization"""
+        try:
+            from qiskit.opflow import PauliSumOp
+            
+            # Prepare Hamiltonian
+            n_periods = len(volume_profile)
+            hamiltonian = np.zeros((2**n_periods, 2**n_periods))
+            
+            # Add market impact term
+            hamiltonian += self._create_impact_term(market_impact)
+            
+            # Add volume profile term
+            hamiltonian += self._create_volume_term(volume_profile)
+            
+            # Add timing constraints
+            hamiltonian += self._create_timing_constraints(n_periods)
+            
+            return PauliSumOp.from_matrix(hamiltonian)
+            
+        except Exception as e:
+            self.logger.error(f"Operator preparation failed: {str(e)}")
+            raise
+
+    def _process_quantum_results(self, counts: Dict[str, int]) -> np.ndarray:
+        """Process quantum measurement results"""
+        # Convert bit strings to array
+        n_qubits = len(next(iter(counts.keys())))
+        result = np.zeros(n_qubits)
+        
+        total_shots = sum(counts.values())
+        for bitstring, count in counts.items():
+            for i, bit in enumerate(bitstring):
+                if bit == '1':
+                    result[i] += count / total_shots
+        
+        return result
+
+    def _extract_portfolio_weights(self, state_vector: np.ndarray) -> np.ndarray:
+        """Extract portfolio weights from quantum state"""
+        # Convert quantum state to weights
+        n_assets = int(np.log2(len(state_vector)))
+        weights = np.zeros(n_assets)
+        
+        for i in range(n_assets):
+            weights[i] = sum(
+                abs(state_vector[j])**2
+                for j in range(len(state_vector))
+                if (j >> i) & 1
+            )
+        
+        # Normalize weights
+        return weights / np.sum(weights)
+
+    def _extract_execution_schedule(self, state_vector: np.ndarray) -> np.ndarray:
+        """Extract execution schedule from quantum state"""
+        # Convert quantum state to schedule
+        n_periods = int(np.log2(len(state_vector)))
+        schedule = np.zeros(n_periods)
+        
+        for i in range(n_periods):
+            schedule[i] = sum(
+                abs(state_vector[j])**2
+                for j in range(len(state_vector))
+                if (j >> i) & 1
+            )
+        
+        # Normalize schedule
+        return schedule / np.sum(schedule)
+
+    def _calculate_portfolio_metrics(
+        self,
+        weights: np.ndarray,
+        returns: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate portfolio performance metrics"""
+        portfolio_returns = np.dot(returns, weights)
+        
+        return {
+            'expected_return': np.mean(portfolio_returns),
+            'risk': np.std(portfolio_returns),
+            'sharpe_ratio': np.mean(portfolio_returns) / np.std(portfolio_returns)
+        }
+
+    def _calculate_execution_metrics(
+        self,
+        schedule: np.ndarray,
+        market_impact: np.ndarray,
+        volume_profile: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate execution performance metrics"""
+        return {
+            'cost': np.dot(schedule, market_impact),
+            'impact': np.sqrt(np.dot(schedule**2, market_impact)),
+            'timing': np.dot(schedule, volume_profile)
+        }

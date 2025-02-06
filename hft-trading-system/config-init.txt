@@ -1,0 +1,278 @@
+[Previous code remains the same until init_config_directory]
+
+def init_config_directory() -> None:
+    """Initialize configuration directory structure"""
+    try:
+        # Create config directory if it doesn't exist
+        config_dir = Path('config')
+        config_dir.mkdir(exist_ok=True)
+        
+        # Create environment-specific directories
+        environments = ['development', 'staging', 'production']
+        for env in environments:
+            env_dir = config_dir / env
+            env_dir.mkdir(exist_ok=True)
+        
+        # Create secrets directory with restricted permissions
+        secrets_dir = config_dir / 'secrets'
+        secrets_dir.mkdir(exist_ok=True)
+        os.chmod(secrets_dir, 0o700)  # Restricted permissions
+        
+        logging.info("Configuration directory structure created")
+        
+    except Exception as e:
+        logging.error(f"Failed to create config directories: {str(e)}")
+        raise
+
+def create_config_files(environment: str) -> None:
+    """Create configuration files for specific environment"""
+    try:
+        configs = create_default_configs()
+        config_dir = Path('config') / environment
+        
+        for filename, config in configs.items():
+            file_path = config_dir / filename
+            
+            # Don't overwrite existing configs
+            if file_path.exists():
+                backup_path = file_path.with_suffix('.yaml.bak')
+                file_path.rename(backup_path)
+                logging.info(f"Backed up existing config to {backup_path}")
+            
+            # Write new config
+            with open(file_path, 'w') as f:
+                yaml.safe_dump(config, f, default_flow_style=False)
+            
+            logging.info(f"Created config file: {file_path}")
+        
+        # Create environment marker
+        with open(config_dir / '.env', 'w') as f:
+            f.write(f"TRADING_ENV={environment}\n")
+        
+    except Exception as e:
+        logging.error(f"Failed to create config files: {str(e)}")
+        raise
+
+def create_secrets_file() -> None:
+    """Create template for secrets file"""
+    try:
+        secrets_template = {
+            'api_keys': {
+                'ibkr': '',
+                'github_models': '',
+                'alpha_vantage': ''
+            },
+            'database': {
+                'postgresql_password': '',
+                'mongodb_password': '',
+                'redis_password': ''
+            },
+            'jwt_secret': '',
+            'encryption_key': '',
+            'webhook_secrets': {
+                'github': '',
+                'slack': ''
+            }
+        }
+        
+        secrets_path = Path('config/secrets/secrets.yaml')
+        
+        if not secrets_path.exists():
+            with open(secrets_path, 'w') as f:
+                yaml.safe_dump(secrets_template, f, default_flow_style=False)
+            
+            # Set restricted permissions
+            os.chmod(secrets_path, 0o600)
+            
+            logging.info("Created secrets template file")
+            
+    except Exception as e:
+        logging.error(f"Failed to create secrets file: {str(e)}")
+        raise
+
+def validate_config(config_dir: Path) -> bool:
+    """Validate configuration files"""
+    try:
+        required_fields = {
+            'database.yaml': ['postgresql', 'mongodb', 'redis'],
+            'trading.yaml': ['ibkr', 'risk_limits', 'execution'],
+            'ml_models.yaml': ['github_models', 'model_configs'],
+            'system.yaml': ['logging', 'monitoring', 'api']
+        }
+        
+        for filename, required in required_fields.items():
+            config_path = config_dir / filename
+            
+            if not config_path.exists():
+                logging.error(f"Missing config file: {filename}")
+                return False
+            
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                
+                for field in required:
+                    if field not in config:
+                        logging.error(f"Missing required field '{field}' in {filename}")
+                        return False
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Config validation failed: {str(e)}")
+        return False
+
+def encrypt_secrets() -> None:
+    """Encrypt sensitive configuration data"""
+    try:
+        from cryptography.fernet import Fernet
+        
+        # Generate encryption key if not exists
+        key_path = Path('config/secrets/encryption.key')
+        if not key_path.exists():
+            key = Fernet.generate_key()
+            with open(key_path, 'wb') as f:
+                f.write(key)
+            os.chmod(key_path, 0o600)
+        else:
+            with open(key_path, 'rb') as f:
+                key = f.read()
+        
+        fernet = Fernet(key)
+        
+        # Encrypt secrets file
+        secrets_path = Path('config/secrets/secrets.yaml')
+        if secrets_path.exists():
+            with open(secrets_path, 'rb') as f:
+                secrets_data = f.read()
+            
+            encrypted_data = fernet.encrypt(secrets_data)
+            
+            encrypted_path = Path('config/secrets/secrets.enc')
+            with open(encrypted_path, 'wb') as f:
+                f.write(encrypted_data)
+            
+            os.chmod(encrypted_path, 0o600)
+            logging.info("Encrypted secrets file created")
+            
+    except Exception as e:
+        logging.error(f"Failed to encrypt secrets: {str(e)}")
+        raise
+
+def setup_environment_variables() -> None:
+    """Setup environment variables"""
+    try:
+        env_vars = {
+            'TRADING_ENV': 'development',  # Default environment
+            'CONFIG_DIR': str(Path('config').absolute()),
+            'SECRETS_DIR': str(Path('config/secrets').absolute()),
+            'LOG_DIR': str(Path('logs').absolute()),
+            'DATA_DIR': str(Path('data').absolute())
+        }
+        
+        env_path = Path('.env')
+        with open(env_path, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        
+        # Also create environment-specific .env files
+        for env in ['development', 'staging', 'production']:
+            env_specific_path = Path(f'.env.{env}')
+            with open(env_specific_path, 'w') as f:
+                env_vars['TRADING_ENV'] = env
+                for key, value in env_vars.items():
+                    f.write(f"{key}={value}\n")
+        
+        logging.info("Environment variables configured")
+        
+    except Exception as e:
+        logging.error(f"Failed to setup environment variables: {str(e)}")
+        raise
+
+def create_config_documentation() -> None:
+    """Create configuration documentation"""
+    try:
+        docs = {
+            'Overview': 'Configuration documentation for the trading system',
+            'Environments': {
+                'development': 'Local development environment',
+                'staging': 'Testing and validation environment',
+                'production': 'Production trading environment'
+            },
+            'Configuration Files': {
+                'database.yaml': 'Database connection settings',
+                'trading.yaml': 'Trading system parameters',
+                'ml_models.yaml': 'Machine learning model configurations',
+                'system.yaml': 'System-wide settings'
+            },
+            'Security': {
+                'secrets': 'Sensitive data stored in encrypted format',
+                'permissions': 'Restricted file permissions for sensitive data'
+            },
+            'Environment Variables': {
+                'TRADING_ENV': 'Current environment',
+                'CONFIG_DIR': 'Configuration directory location',
+                'SECRETS_DIR': 'Secrets directory location'
+            }
+        }
+        
+        docs_path = Path('config/README.md')
+        with open(docs_path, 'w') as f:
+            f.write("# Trading System Configuration\n\n")
+            
+            for section, content in docs.items():
+                f.write(f"## {section}\n\n")
+                
+                if isinstance(content, str):
+                    f.write(f"{content}\n\n")
+                else:
+                    for item, description in content.items():
+                        f.write(f"### {item}\n{description}\n\n")
+        
+        logging.info("Configuration documentation created")
+        
+    except Exception as e:
+        logging.error(f"Failed to create documentation: {str(e)}")
+        raise
+
+def main():
+    """Main configuration initialization function"""
+    try:
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        
+        # Initialize directory structure
+        init_config_directory()
+        
+        # Create configs for each environment
+        for env in ['development', 'staging', 'production']:
+            create_config_files(env)
+        
+        # Create secrets template
+        create_secrets_file()
+        
+        # Encrypt secrets
+        encrypt_secrets()
+        
+        # Setup environment variables
+        setup_environment_variables()
+        
+        # Create documentation
+        create_config_documentation()
+        
+        # Validate configurations
+        if not validate_config(Path('config/development')):
+            logging.error("Configuration validation failed")
+            return 1
+        
+        logging.info("Configuration initialization completed successfully")
+        return 0
+        
+    except Exception as e:
+        logging.error(f"Configuration initialization failed: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

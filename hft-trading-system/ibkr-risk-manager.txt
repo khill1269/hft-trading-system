@@ -1,0 +1,385 @@
+[Previous code remains the same...]
+
+    def _start_risk_monitor(self) -> None:
+        """Start risk monitoring threads"""
+        def monitor_positions():
+            while True:
+                try:
+                    self._update_positions()
+                    self._check_risk_limits()
+                    self._update_risk_metrics()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        RiskError(f"Position monitoring failed: {str(e)}")
+                    )
+                time.sleep(1)
+        
+        def monitor_margin():
+            while True:
+                try:
+                    self._update_margin_requirements()
+                    self._check_margin_limits()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        RiskError(f"Margin monitoring failed: {str(e)}")
+                    )
+                time.sleep(5)
+        
+        threading.Thread(target=monitor_positions, daemon=True).start()
+        threading.Thread(target=monitor_margin, daemon=True).start()
+    
+    def _update_positions(self) -> None:
+        """Update position information from IBKR"""
+        try:
+            # Process position updates
+            while not self.wrapper.position_updates.empty():
+                update = self.wrapper.position_updates.get()
+                self._process_position_update(update)
+            
+            # Process PnL updates
+            while not self.wrapper.pnl_updates.empty():
+                update = self.wrapper.pnl_updates.get()
+                self._process_pnl_update(update)
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Position update failed: {str(e)}")
+            )
+    
+    def _process_position_update(self, update: Dict) -> None:
+        """Process position update from IBKR"""
+        try:
+            contract = update['contract']
+            symbol = contract.symbol
+            
+            position = Position(
+                symbol=symbol,
+                quantity=Decimal(str(update['position'])),
+                average_cost=Decimal(str(update['average_cost'])),
+                market_value=Decimal(str(update['market_value'])),
+                unrealized_pnl=Decimal(str(update['unrealized_pnl'])),
+                realized_pnl=Decimal(str(update['realized_pnl'])),
+                initial_margin=Decimal('0'),  # Will be updated by margin update
+                maintenance_margin=Decimal('0'),
+                last_update=datetime.utcnow()
+            )
+            
+            # Store position
+            self._positions[symbol] = position
+            
+            # Store historical data
+            if symbol not in self._historical_positions:
+                self._historical_positions[symbol] = []
+            self._historical_positions[symbol].append(position)
+            
+            # Update portfolio value
+            self._update_portfolio_value()
+            
+            # Log significant changes
+            self._log_position_change(symbol, position)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Position processing failed: {str(e)}")
+            )
+    
+    def _update_portfolio_value(self) -> None:
+        """Update total portfolio value"""
+        try:
+            total_value = sum(
+                pos.market_value for pos in self._positions.values()
+            )
+            
+            # Check for significant change
+            prev_value = self._portfolio_value
+            if abs((total_value - prev_value) / prev_value) > Decimal('0.01'):
+                self.logger.log_event(
+                    "PORTFOLIO_VALUE_CHANGE",
+                    "Significant portfolio value change",
+                    extra_data={
+                        "previous_value": str(prev_value),
+                        "new_value": str(total_value),
+                        "change_pct": str((total_value - prev_value) / prev_value * 100)
+                    }
+                )
+            
+            self._portfolio_value = total_value
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Portfolio value update failed: {str(e)}")
+            )
+    
+    def _check_risk_limits(self) -> None:
+        """Check all risk limits and generate alerts"""
+        try:
+            # Calculate current risk metrics
+            current_metrics = self._calculate_risk_metrics(self._positions)
+            if not current_metrics:
+                return
+            
+            # Store metrics history
+            self._risk_metrics_history.append(current_metrics)
+            
+            # Check VaR limit
+            if current_metrics.var_95 > self._portfolio_limits['var_limit']:
+                self._generate_risk_alert(
+                    "VAR_LIMIT_EXCEEDED",
+                    f"VaR exceeds limit: {current_metrics.var_95}"
+                )
+            
+            # Check leverage limit
+            if current_metrics.leverage > float(self._portfolio_limits['max_leverage']):
+                self._generate_risk_alert(
+                    "LEVERAGE_LIMIT_EXCEEDED",
+                    f"Leverage exceeds limit: {current_metrics.leverage}"
+                )
+            
+            # Check concentration
+            if current_metrics.concentration_risk > self._risk_thresholds['concentration'][RiskLevel.HIGH]:
+                self._generate_risk_alert(
+                    "CONCENTRATION_RISK_HIGH",
+                    f"High concentration risk: {current_metrics.concentration_risk}"
+                )
+            
+            # Check correlation
+            if current_metrics.correlation_risk > 0.8:
+                self._generate_risk_alert(
+                    "CORRELATION_RISK_HIGH",
+                    f"High correlation risk: {current_metrics.correlation_risk}"
+                )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Risk limit check failed: {str(e)}")
+            )
+    
+    def _generate_risk_alert(
+        self,
+        alert_type: str,
+        message: str,
+        level: RiskLevel = RiskLevel.HIGH
+    ) -> None:
+        """Generate risk alert"""
+        self.logger.log_event(
+            f"RISK_ALERT_{alert_type}",
+            message,
+            level="ERROR" if level == RiskLevel.CRITICAL else "WARNING",
+            extra_data={
+                "risk_level": level.value,
+                "portfolio_value": str(self._portfolio_value),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+    
+    def _update_margin_requirements(self) -> None:
+        """Update margin requirements from IBKR"""
+        try:
+            while not self.wrapper.margin_updates.empty():
+                update = self.wrapper.margin_updates.get()
+                
+                # Update margin used
+                self._margin_used = Decimal(str(update.get('margin_used', 0)))
+                
+                # Update position margins
+                for symbol, req in update.get('position_requirements', {}).items():
+                    if symbol in self._positions:
+                        position = self._positions[symbol]
+                        position.initial_margin = Decimal(str(req['initial']))
+                        position.maintenance_margin = Decimal(str(req['maintenance']))
+                
+                # Check margin limits
+                self._check_margin_limits()
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Margin update failed: {str(e)}")
+            )
+    
+    def _check_margin_limits(self) -> None:
+        """Check margin limits and requirements"""
+        try:
+            if not self._portfolio_value:
+                return
+            
+            # Calculate margin utilization
+            margin_utilization = self._margin_used / self._portfolio_value
+            
+            # Determine risk level
+            risk_level = self._determine_risk_level(
+                margin_utilization,
+                self._risk_thresholds['utilization']
+            )
+            
+            # Update risk level if changed
+            if self._risk_levels.get('margin') != risk_level:
+                self._risk_levels['margin'] = risk_level
+                
+                if risk_level >= RiskLevel.HIGH:
+                    self._generate_risk_alert(
+                        "MARGIN_UTILIZATION_HIGH",
+                        f"High margin utilization: {margin_utilization:.2%}",
+                        risk_level
+                    )
+                
+                # Take action for critical levels
+                if risk_level == RiskLevel.CRITICAL:
+                    asyncio.create_task(self._handle_critical_margin())
+                    
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Margin limit check failed: {str(e)}")
+            )
+    
+    async def _handle_critical_margin(self) -> None:
+        """Handle critical margin situation"""
+        try:
+            self.logger.log_event(
+                "CRITICAL_MARGIN_ACTION",
+                "Initiating emergency risk reduction",
+                level="ERROR"
+            )
+            
+            # Calculate required reduction
+            excess_margin = self._margin_used - (
+                self._portfolio_value * Decimal('0.5')  # Target 50% utilization
+            )
+            
+            if excess_margin <= 0:
+                return
+            
+            # Identify positions to reduce
+            reduction_candidates = sorted(
+                self._positions.items(),
+                key=lambda x: x[1].market_value,
+                reverse=True
+            )
+            
+            reduced_margin = Decimal('0')
+            for symbol, position in reduction_candidates:
+                if reduced_margin >= excess_margin:
+                    break
+                
+                # Calculate reduction size
+                reduction_value = min(
+                    position.market_value,
+                    excess_margin - reduced_margin
+                )
+                
+                # Submit reduction order
+                await self._submit_risk_reduction_order(
+                    symbol,
+                    position,
+                    reduction_value
+                )
+                
+                reduced_margin += reduction_value
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Critical margin handling failed: {str(e)}")
+            )
+    
+    async def _submit_risk_reduction_order(
+        self,
+        symbol: str,
+        position: Position,
+        reduction_value: Decimal
+    ) -> None:
+        """Submit order to reduce risk"""
+        try:
+            current_price = self.market_data_client.get_latest_price(symbol)
+            if not current_price:
+                return
+            
+            # Calculate quantity to reduce
+            quantity = reduction_value / current_price
+            if quantity <= 0:
+                return
+            
+            # Submit market order
+            side = "SELL" if position.quantity > 0 else "BUY"
+            await self.execution_client.submit_order(
+                symbol=symbol,
+                side=side,
+                quantity=float(quantity),
+                order_type="MKT",
+                time_in_force="IOC"  # Immediate-or-Cancel
+            )
+            
+            self.logger.log_event(
+                "RISK_REDUCTION_ORDER",
+                f"Submitted risk reduction order for {symbol}",
+                extra_data={
+                    "side": side,
+                    "quantity": str(quantity),
+                    "reduction_value": str(reduction_value)
+                }
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Risk reduction order failed: {str(e)}")
+            )
+    
+    def _determine_risk_level(
+        self,
+        value: float,
+        thresholds: Dict[RiskLevel, float]
+    ) -> RiskLevel:
+        """Determine risk level based on thresholds"""
+        for level in reversed(RiskLevel):
+            if value >= thresholds[level]:
+                return level
+        return RiskLevel.LOW
+    
+    def get_risk_report(self) -> Dict:
+        """Generate comprehensive risk report"""
+        try:
+            current_metrics = self._calculate_risk_metrics(self._positions)
+            
+            report = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'portfolio_value': str(self._portfolio_value),
+                'margin_used': str(self._margin_used),
+                'margin_utilization': str(self._margin_used / self._portfolio_value),
+                'risk_levels': {k: v.value for k, v in self._risk_levels.items()},
+                'metrics': {
+                    'var_95': str(current_metrics.var_95),
+                    'cvar_95': str(current_metrics.cvar_95),
+                    'beta': current_metrics.beta,
+                    'volatility': current_metrics.volatility,
+                    'sharpe_ratio': current_metrics.sharpe_ratio,
+                    'max_drawdown': current_metrics.max_drawdown,
+                    'leverage': current_metrics.leverage,
+                    'concentration_risk': current_metrics.concentration_risk,
+                    'correlation_risk': current_metrics.correlation_risk
+                },
+                'positions': [
+                    {
+                        'symbol': symbol,
+                        'quantity': str(pos.quantity),
+                        'market_value': str(pos.market_value),
+                        'unrealized_pnl': str(pos.unrealized_pnl),
+                        'margin': str(pos.initial_margin)
+                    }
+                    for symbol, pos in self._positions.items()
+                ],
+                'limits': {
+                    'var': str(self._portfolio_limits['var_limit']),
+                    'leverage': str(self._portfolio_limits['max_leverage']),
+                    'concentration': str(self._portfolio_limits['max_concentration'])
+                }
+            }
+            
+            return report
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                RiskError(f"Risk report generation failed: {str(e)}")
+            )
+            return {}
+
+class RiskError(Exception):
+    """Custom exception for risk management errors"""
+    pass

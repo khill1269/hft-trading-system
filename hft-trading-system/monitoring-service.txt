@@ -1,0 +1,400 @@
+from typing import Dict, List, Optional, Set
+from decimal import Decimal
+from datetime import datetime, timedelta
+import threading
+from dataclasses import dataclass
+import asyncio
+from collections import deque
+import psutil
+import time
+import uuid
+
+@dataclass
+class SystemMetrics:
+    cpu_usage: float
+    memory_usage: float
+    disk_usage: float
+    network_latency: float
+    error_rate: float
+    uptime: float
+
+@dataclass
+class TradingMetrics:
+    total_pnl: Decimal
+    daily_pnl: Decimal
+    total_trades: int
+    win_rate: float
+    active_positions: int
+    order_fill_rate: float
+
+@dataclass
+class Alert:
+    id: str
+    timestamp: datetime
+    level: str  # INFO, WARNING, ERROR, CRITICAL
+    category: str
+    message: str
+    details: Dict
+
+class MonitoringService:
+    """System monitoring and alerting service"""
+    
+    def __init__(
+        self,
+        config: Dict,
+        logger,
+        error_handler
+    ):
+        self.config = config
+        self.logger = logger
+        self.error_handler = error_handler
+        
+        # Metrics storage
+        self._system_metrics_history: deque = deque(maxlen=1000)
+        self._trading_metrics_history: deque = deque(maxlen=1000)
+        self._alerts: deque = deque(maxlen=1000)
+        
+        # Performance tracking
+        self._latency_measurements: Dict[str, List[float]] = {}
+        self._error_counts: Dict[str, int] = {}
+        
+        # Component status
+        self._component_status: Dict[str, bool] = {}
+        self._last_heartbeats: Dict[str, datetime] = {}
+        
+        # Alert thresholds
+        self._alert_thresholds = {
+            'cpu_usage': 80.0,  # percentage
+            'memory_usage': 80.0,  # percentage
+            'disk_usage': 80.0,  # percentage
+            'error_rate': 5.0,  # errors per minute
+            'latency': 1000.0,  # milliseconds
+            'position_limit': Decimal('1000000')  # maximum position size
+        }
+        
+        # Thread safety
+        self._lock = threading.Lock()
+        
+        # Start monitoring
+        self._start_monitoring()
+    
+    def register_component(self, component_name: str) -> None:
+        """Register a system component for monitoring"""
+        with self._lock:
+            self._component_status[component_name] = True
+            self._last_heartbeats[component_name] = datetime.utcnow()
+            self._error_counts[component_name] = 0
+            self._latency_measurements[component_name] = []
+    
+    def record_heartbeat(self, component_name: str) -> None:
+        """Record component heartbeat"""
+        with self._lock:
+            if component_name in self._last_heartbeats:
+                self._last_heartbeats[component_name] = datetime.utcnow()
+                self._component_status[component_name] = True
+    
+    def record_latency(self, component_name: str, latency: float) -> None:
+        """Record operation latency"""
+        with self._lock:
+            if component_name in self._latency_measurements:
+                self._latency_measurements[component_name].append(latency)
+                
+                # Keep only recent measurements
+                cutoff_time = time.time() - 300  # 5 minutes
+                self._latency_measurements[component_name] = [
+                    l for l in self._latency_measurements[component_name]
+                    if l > cutoff_time
+                ]
+                
+                # Check latency threshold
+                avg_latency = sum(self._latency_measurements[component_name]) / len(
+                    self._latency_measurements[component_name]
+                )
+                if avg_latency > self._alert_thresholds['latency']:
+                    self._create_alert(
+                        'WARNING',
+                        'HIGH_LATENCY',
+                        f'High latency detected in {component_name}',
+                        {'latency': avg_latency, 'component': component_name}
+                    )
+    
+    def record_error(self, component_name: str, error: Exception) -> None:
+        """Record component error"""
+        with self._lock:
+            if component_name in self._error_counts:
+                self._error_counts[component_name] += 1
+                
+                # Check error rate
+                error_rate = self._calculate_error_rate(component_name)
+                if error_rate > self._alert_thresholds['error_rate']:
+                    self._create_alert(
+                        'ERROR',
+                        'HIGH_ERROR_RATE',
+                        f'High error rate in {component_name}',
+                        {
+                            'error_rate': error_rate,
+                            'component': component_name,
+                            'last_error': str(error)
+                        }
+                    )
+    
+    def get_system_metrics(self) -> SystemMetrics:
+        """Get current system metrics"""
+        try:
+            cpu_usage = psutil.cpu_percent()
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            metrics = SystemMetrics(
+                cpu_usage=cpu_usage,
+                memory_usage=memory.percent,
+                disk_usage=disk.percent,
+                network_latency=self._calculate_average_latency(),
+                error_rate=self._calculate_total_error_rate(),
+                uptime=self._calculate_uptime()
+            )
+            
+            self._system_metrics_history.append(metrics)
+            return metrics
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                MonitoringError(f"Failed to get system metrics: {str(e)}")
+            )
+            return None
+    
+    def get_trading_metrics(self) -> TradingMetrics:
+        """Get current trading metrics"""
+        try:
+            # Calculate trading metrics from stored data
+            metrics = TradingMetrics(
+                total_pnl=self._calculate_total_pnl(),
+                daily_pnl=self._calculate_daily_pnl(),
+                total_trades=self._calculate_total_trades(),
+                win_rate=self._calculate_win_rate(),
+                active_positions=self._count_active_positions(),
+                order_fill_rate=self._calculate_fill_rate()
+            )
+            
+            self._trading_metrics_history.append(metrics)
+            return metrics
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                MonitoringError(f"Failed to get trading metrics: {str(e)}")
+            )
+            return None
+    
+    def get_alerts(self, count: int = 10) -> List[Alert]:
+        """Get recent alerts"""
+        with self._lock:
+            return list(self._alerts)[-count:]
+    
+    def get_component_status(self) -> Dict[str, bool]:
+        """Get status of all monitored components"""
+        with self._lock:
+            self._check_component_timeouts()
+            return dict(self._component_status)
+    
+    def _start_monitoring(self) -> None:
+        """Start monitoring threads"""
+        def metrics_thread():
+            while True:
+                try:
+                    self._collect_metrics()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        MonitoringError(f"Metrics collection failed: {str(e)}")
+                    )
+                time.sleep(1)
+        
+        def health_check_thread():
+            while True:
+                try:
+                    self._check_system_health()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        MonitoringError(f"Health check failed: {str(e)}")
+                    )
+                time.sleep(5)
+        
+        threading.Thread(target=metrics_thread, daemon=True).start()
+        threading.Thread(target=health_check_thread, daemon=True).start()
+    
+    def _collect_metrics(self) -> None:
+        """Collect and store system metrics"""
+        metrics = self.get_system_metrics()
+        if metrics:
+            self._check_metrics_thresholds(metrics)
+    
+    def _check_system_health(self) -> None:
+        """Perform system health checks"""
+        # Check component health
+        self._check_component_timeouts()
+        
+        # Check disk space
+        self._check_disk_space()
+        
+        # Check memory usage
+        self._check_memory_usage()
+        
+        # Check error rates
+        self._check_error_rates()
+    
+    def _check_metrics_thresholds(self, metrics: SystemMetrics) -> None:
+        """Check if metrics exceed thresholds"""
+        if metrics.cpu_usage > self._alert_thresholds['cpu_usage']:
+            self._create_alert(
+                'WARNING',
+                'HIGH_CPU_USAGE',
+                'High CPU usage detected',
+                {'cpu_usage': metrics.cpu_usage}
+            )
+        
+        if metrics.memory_usage > self._alert_thresholds['memory_usage']:
+            self._create_alert(
+                'WARNING',
+                'HIGH_MEMORY_USAGE',
+                'High memory usage detected',
+                {'memory_usage': metrics.memory_usage}
+            )
+    
+    def _check_component_timeouts(self) -> None:
+        """Check for component timeouts"""
+        current_time = datetime.utcnow()
+        timeout = timedelta(seconds=30)
+        
+        with self._lock:
+            for component, last_heartbeat in self._last_heartbeats.items():
+                if current_time - last_heartbeat > timeout:
+                    self._component_status[component] = False
+                    self._create_alert(
+                        'ERROR',
+                        'COMPONENT_TIMEOUT',
+                        f'Component {component} has timed out',
+                        {
+                            'component': component,
+                            'last_heartbeat': last_heartbeat.isoformat()
+                        }
+                    )
+    
+    def _create_alert(
+        self,
+        level: str,
+        category: str,
+        message: str,
+        details: Dict
+    ) -> None:
+        """Create and store new alert"""
+        alert = Alert(
+            id=str(uuid.uuid4()),
+            timestamp=datetime.utcnow(),
+            level=level,
+            category=category,
+            message=message,
+            details=details
+        )
+        
+        with self._lock:
+            self._alerts.append(alert)
+        
+        self.logger.log_event(
+            f"ALERT_{category}",
+            message,
+            level=level,
+            extra_data=details
+        )
+    
+    def _calculate_average_latency(self) -> float:
+        """Calculate average latency across all components"""
+        total_latency = 0
+        count = 0
+        
+        for measurements in self._latency_measurements.values():
+            if measurements:
+                total_latency += sum(measurements)
+                count += len(measurements)
+        
+        return total_latency / count if count > 0 else 0
+    
+    def _calculate_error_rate(self, component_name: str) -> float:
+        """Calculate error rate for a component (errors per minute)"""
+        error_count = self._error_counts.get(component_name, 0)
+        return error_count / 5  # errors per minute based on 5-minute window
+    
+    def _calculate_total_error_rate(self) -> float:
+        """Calculate total system error rate"""
+        return sum(self._error_counts.values()) / 5
+    
+    def _calculate_uptime(self) -> float:
+        """Calculate system uptime percentage"""
+        # Placeholder for actual uptime calculation
+        return 99.9
+    
+    def _check_disk_space(self) -> None:
+        """Check available disk space"""
+        disk = psutil.disk_usage('/')
+        if disk.percent > self._alert_thresholds['disk_usage']:
+            self._create_alert(
+                'WARNING',
+                'LOW_DISK_SPACE',
+                'Low disk space detected',
+                {'available': disk.free, 'total': disk.total}
+            )
+    
+    def _check_memory_usage(self) -> None:
+        """Check memory usage"""
+        memory = psutil.virtual_memory()
+        if memory.percent > self._alert_thresholds['memory_usage']:
+            self._create_alert(
+                'WARNING',
+                'HIGH_MEMORY_USAGE',
+                'High memory usage detected',
+                {'usage_percent': memory.percent}
+            )
+    
+    def _check_error_rates(self) -> None:
+        """Check error rates for all components"""
+        for component in self._error_counts:
+            error_rate = self._calculate_error_rate(component)
+            if error_rate > self._alert_thresholds['error_rate']:
+                self._create_alert(
+                    'WARNING',
+                    'HIGH_ERROR_RATE',
+                    f'High error rate in {component}',
+                    {'error_rate': error_rate}
+                )
+    
+    def _calculate_total_pnl(self) -> Decimal:
+        """Calculate total P&L"""
+        # Placeholder for actual P&L calculation
+        return Decimal('0')
+    
+    def _calculate_daily_pnl(self) -> Decimal:
+        """Calculate daily P&L"""
+        # Placeholder for actual daily P&L calculation
+        return Decimal('0')
+    
+    def _calculate_total_trades(self) -> int:
+        """Calculate total number of trades"""
+        # Placeholder for actual trade count
+        return 0
+    
+    def _calculate_win_rate(self) -> float:
+        """Calculate trading win rate"""
+        # Placeholder for actual win rate calculation
+        return 0.0
+    
+    def _count_active_positions(self) -> int:
+        """Count active positions"""
+        # Placeholder for actual position count
+        return 0
+    
+    def _calculate_fill_rate(self) -> float:
+        """Calculate order fill rate"""
+        # Placeholder for actual fill rate calculation
+        return 0.0
+
+class MonitoringError(Exception):
+    """Custom exception for monitoring errors"""
+    pass

@@ -1,0 +1,216 @@
+[Previous code remains the same until _generate_technical_features]
+
+    def _generate_technical_features(
+        self,
+        data: pd.DataFrame,
+        metadata: ModelMetadata
+    ) -> pd.DataFrame:
+        """Generate technical analysis features"""
+        features = pd.DataFrame()
+        
+        # Moving averages
+        for window in [5, 10, 20, 50]:
+            features[f'ma_{window}'] = data['close'].rolling(window).mean()
+        
+        # Relative Strength Index (RSI)
+        delta = data['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        features['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp1 = data['close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['close'].ewm(span=26, adjust=False).mean()
+        features['macd'] = exp1 - exp2
+        features['macd_signal'] = features['macd'].ewm(span=9, adjust=False).mean()
+        
+        # Bollinger Bands
+        middle_band = data['close'].rolling(window=20).mean()
+        std_dev = data['close'].rolling(window=20).std()
+        features['bb_upper'] = middle_band + (std_dev * 2)
+        features['bb_lower'] = middle_band - (std_dev * 2)
+        features['bb_width'] = (features['bb_upper'] - features['bb_lower']) / middle_band
+        
+        # Volume features
+        features['volume_ma'] = data['volume'].rolling(window=20).mean()
+        features['volume_std'] = data['volume'].rolling(window=20).std()
+        
+        return features
+    
+    def _generate_sentiment_features(
+        self,
+        data: pd.DataFrame,
+        metadata: ModelMetadata
+    ) -> pd.DataFrame:
+        """Generate sentiment analysis features"""
+        features = pd.DataFrame()
+        
+        if 'sentiment_score' in data.columns:
+            # Sentiment moving averages
+            for window in [5, 10, 20]:
+                features[f'sentiment_ma_{window}'] = data['sentiment_score'].rolling(window).mean()
+            
+            # Sentiment volatility
+            features['sentiment_std'] = data['sentiment_score'].rolling(window=20).std()
+            
+            # Sentiment momentum
+            features['sentiment_momentum'] = data['sentiment_score'].diff(5)
+        
+        return features
+    
+    def _generate_market_features(
+        self,
+        data: pd.DataFrame,
+        metadata: ModelMetadata
+    ) -> pd.DataFrame:
+        """Generate market state features"""
+        features = pd.DataFrame()
+        
+        # Price momentum
+        for window in [1, 5, 10]:
+            features[f'return_{window}d'] = data['close'].pct_change(window)
+        
+        # Volatility
+        features['volatility'] = data['close'].pct_change().rolling(window=20).std()
+        
+        # Trading range
+        features['range'] = (data['high'] - data['low']) / data['close']
+        
+        # Volume momentum
+        features['volume_momentum'] = data['volume'].pct_change(5)
+        
+        return features
+    
+    def _generate_temporal_features(
+        self,
+        data: pd.DataFrame,
+        metadata: ModelMetadata
+    ) -> pd.DataFrame:
+        """Generate time-based features"""
+        features = pd.DataFrame()
+        
+        # Convert index to datetime if needed
+        if not isinstance(data.index, pd.DatetimeIndex):
+            data.index = pd.to_datetime(data.index)
+        
+        # Time-based features
+        features['hour'] = data.index.hour
+        features['day_of_week'] = data.index.dayofweek
+        features['day_of_month'] = data.index.day
+        features['month'] = data.index.month
+        features['quarter'] = data.index.quarter
+        
+        # Market session indicators
+        features['is_market_open'] = (
+            (features['hour'] >= 9) & (features['hour'] <= 16)
+        ).astype(int)
+        
+        return features
+    
+    def _create_target(
+        self,
+        data: pd.DataFrame,
+        metadata: ModelMetadata
+    ) -> pd.Series:
+        """Create target variable based on model type"""
+        if metadata.model_type == ModelType.PRICE_PREDICTION:
+            # Future price change
+            return data['close'].shift(-metadata.prediction_horizon)
+            
+        elif metadata.model_type == ModelType.TREND_PREDICTION:
+            # Binary trend (1 for up, 0 for down)
+            future_returns = data['close'].pct_change(metadata.prediction_horizon).shift(-metadata.prediction_horizon)
+            return (future_returns > 0).astype(int)
+            
+        elif metadata.model_type == ModelType.VOLATILITY_PREDICTION:
+            # Future volatility
+            returns = data['close'].pct_change()
+            future_vol = returns.rolling(window=metadata.prediction_horizon).std().shift(-metadata.prediction_horizon)
+            return future_vol
+            
+        else:
+            raise AIModelError(f"Unsupported model type: {metadata.model_type}")
+    
+    def _calculate_prediction_confidence(
+        self,
+        model: Any,
+        features: np.ndarray,
+        prediction: float
+    ) -> float:
+        """Calculate confidence score for prediction"""
+        try:
+            if hasattr(model, 'predict_proba'):
+                # For classifiers
+                probas = model.predict_proba(features)
+                return float(np.max(probas, axis=1)[0])
+            elif hasattr(model, 'estimators_'):
+                # For ensemble models
+                predictions = np.array([
+                    estimator.predict(features) 
+                    for estimator in model.estimators_
+                ])
+                return 1 - float(np.std(predictions) / np.mean(predictions))
+            else:
+                # Default confidence based on model score
+                return float(max(min(model.score(features, [prediction]), 1.0), 0.0))
+        except:
+            return 0.5
+    
+    def _calculate_performance_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate model performance metrics"""
+        metrics = {}
+        
+        # Regression metrics
+        mse = np.mean((y_true - y_pred) ** 2)
+        metrics['mse'] = float(mse)
+        metrics['rmse'] = float(np.sqrt(mse))
+        metrics['mae'] = float(np.mean(np.abs(y_true - y_pred)))
+        
+        # R-squared
+        y_mean = np.mean(y_true)
+        ss_tot = np.sum((y_true - y_mean) ** 2)
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        metrics['r2'] = float(1 - (ss_res / ss_tot))
+        
+        # Directional accuracy
+        direction_match = np.sign(y_true[1:] - y_true[:-1]) == np.sign(y_pred[1:] - y_pred[:-1])
+        metrics['directional_accuracy'] = float(np.mean(direction_match))
+        
+        return metrics
+    
+    def _start_model_updater(self) -> None:
+        """Start model update thread"""
+        def updater_thread():
+            while True:
+                try:
+                    self._update_models()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        AIModelError(f"Model update failed: {str(e)}")
+                    )
+                time.sleep(3600)  # Update every hour
+        
+        thread = threading.Thread(target=updater_thread, daemon=True)
+        thread.start()
+    
+    def _update_models(self) -> None:
+        """Update all models with new data"""
+        for model_id in self._models:
+            try:
+                # Check if update is needed
+                metadata = self._model_metadata[model_id]
+                if (datetime.utcnow() - metadata.last_trained).days >= 1:
+                    asyncio.run(self.update_model(model_id))
+            except Exception as e:
+                self.error_handler.handle_error(
+                    AIModelError(f"Failed to update model {model_id}: {str(e)}")
+                )
+
+class AIModelError(Exception):
+    """Custom exception for AI model errors"""
+    pass

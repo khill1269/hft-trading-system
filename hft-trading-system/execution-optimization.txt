@@ -1,0 +1,363 @@
+from typing import Dict, Optional, List, Tuple
+from decimal import Decimal
+from datetime import datetime, timedelta
+import numpy as np
+from dataclasses import dataclass
+from enum import Enum
+
+@dataclass
+class MarketMetrics:
+    """Current market metrics for optimization"""
+    volatility: Decimal
+    spread: Decimal
+    volume: Decimal
+    average_trade_size: Decimal
+    price: Decimal
+    bid: Decimal
+    ask: Decimal
+    last_trade_time: datetime
+
+@dataclass
+class OptimizationResult:
+    """Result of execution optimization"""
+    suggested_order_type: str
+    suggested_price: Optional[Decimal]
+    suggested_quantity: Decimal
+    time_window: int  # seconds
+    urgency: str  # HIGH, MEDIUM, LOW
+    expected_impact: Decimal
+    confidence_score: float
+
+class ExecutionStrategy(Enum):
+    PASSIVE = "PASSIVE"  # Minimize market impact
+    NORMAL = "NORMAL"   # Balance impact and timing
+    AGGRESSIVE = "AGGRESSIVE"  # Prioritize execution speed
+
+class ExecutionOptimizer:
+    """Optimizes order execution based on market conditions"""
+    
+    def __init__(
+        self,
+        market_data_manager,
+        config: Dict,
+        logger,
+        error_handler
+    ):
+        self.market_data_manager = market_data_manager
+        self.config = config
+        self.logger = logger
+        self.error_handler = error_handler
+        
+        # Configuration parameters
+        self.max_participation_rate = Decimal('0.3')  # Maximum market participation
+        self.min_trade_size = Decimal('100')  # Minimum trade size
+        self.impact_threshold = Decimal('0.001')  # 10 bps impact threshold
+        
+        # Market impact model parameters
+        self.permanent_impact_factor = Decimal('0.1')
+        self.temporary_impact_factor = Decimal('0.2')
+    
+    def optimize_execution(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        strategy: ExecutionStrategy = ExecutionStrategy.NORMAL,
+        time_window: Optional[int] = None
+    ) -> OptimizationResult:
+        """
+        Optimize order execution based on market conditions
+        
+        Args:
+            symbol: Trading symbol
+            side: BUY or SELL
+            quantity: Order quantity
+            strategy: Execution strategy to use
+            time_window: Time window for execution in seconds
+        """
+        try:
+            # Get current market metrics
+            metrics = self._get_market_metrics(symbol)
+            
+            # Calculate optimal execution parameters
+            result = self._calculate_optimal_execution(
+                metrics, side, quantity, strategy, time_window
+            )
+            
+            self.logger.log_event(
+                "EXECUTION_OPTIMIZATION",
+                f"Optimized execution for {symbol}",
+                extra_data={
+                    "quantity": str(quantity),
+                    "strategy": strategy.value,
+                    "suggested_price": str(result.suggested_price)
+                }
+            )
+            
+            return result
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OptimizationError(f"Optimization failed: {str(e)}")
+            )
+            raise
+    
+    def _get_market_metrics(self, symbol: str) -> MarketMetrics:
+        """Get current market metrics for symbol"""
+        # Get market data
+        current_price = self.market_data_manager.get_latest_price(symbol)
+        if not current_price:
+            raise OptimizationError(f"No price data for {symbol}")
+            
+        # Get recent trades
+        trades = self.market_data_manager.get_recent_trades(symbol, limit=100)
+        
+        # Calculate metrics
+        volatility = self._calculate_volatility(trades)
+        spread = self._calculate_spread(symbol)
+        volume = self._calculate_volume(trades)
+        avg_trade_size = self._calculate_average_trade_size(trades)
+        
+        return MarketMetrics(
+            volatility=volatility,
+            spread=spread,
+            volume=volume,
+            average_trade_size=avg_trade_size,
+            price=current_price,
+            bid=self.market_data_manager.get_bid(symbol),
+            ask=self.market_data_manager.get_ask(symbol),
+            last_trade_time=trades[-1].timestamp if trades else datetime.utcnow()
+        )
+    
+    def _calculate_optimal_execution(
+        self,
+        metrics: MarketMetrics,
+        side: str,
+        quantity: Decimal,
+        strategy: ExecutionStrategy,
+        time_window: Optional[int]
+    ) -> OptimizationResult:
+        """Calculate optimal execution parameters"""
+        # Determine execution urgency
+        urgency = self._determine_urgency(metrics, quantity, strategy)
+        
+        # Calculate suggested price
+        suggested_price = self._calculate_suggested_price(
+            metrics, side, quantity, urgency
+        )
+        
+        # Calculate suggested quantity
+        suggested_quantity = self._calculate_suggested_quantity(
+            metrics, quantity, urgency
+        )
+        
+        # Calculate expected market impact
+        impact = self._estimate_market_impact(
+            metrics, suggested_quantity, suggested_price
+        )
+        
+        # Calculate confidence score
+        confidence = self._calculate_confidence_score(metrics, impact)
+        
+        # Determine time window if not provided
+        if not time_window:
+            time_window = self._calculate_time_window(
+                metrics, quantity, urgency
+            )
+        
+        return OptimizationResult(
+            suggested_order_type=self._determine_order_type(metrics, urgency),
+            suggested_price=suggested_price,
+            suggested_quantity=suggested_quantity,
+            time_window=time_window,
+            urgency=urgency,
+            expected_impact=impact,
+            confidence_score=confidence
+        )
+    
+    def _determine_urgency(
+        self,
+        metrics: MarketMetrics,
+        quantity: Decimal,
+        strategy: ExecutionStrategy
+    ) -> str:
+        """Determine execution urgency based on market conditions"""
+        # Calculate quantity as percentage of volume
+        volume_participation = quantity / metrics.volume
+        
+        # Base urgency on strategy
+        if strategy == ExecutionStrategy.AGGRESSIVE:
+            base_urgency = "HIGH"
+        elif strategy == ExecutionStrategy.PASSIVE:
+            base_urgency = "LOW"
+        else:
+            base_urgency = "MEDIUM"
+        
+        # Adjust based on market conditions
+        if volume_participation > self.max_participation_rate:
+            return "LOW"  # Force low urgency for large orders
+        elif metrics.volatility > Decimal('0.02'):  # High volatility
+            return "HIGH" if base_urgency != "LOW" else "MEDIUM"
+        
+        return base_urgency
+    
+    def _calculate_suggested_price(
+        self,
+        metrics: MarketMetrics,
+        side: str,
+        quantity: Decimal,
+        urgency: str
+    ) -> Decimal:
+        """Calculate suggested limit price"""
+        spread_adjustment = metrics.spread * Decimal('0.5')
+        
+        if side == "BUY":
+            base_price = metrics.ask
+            if urgency == "HIGH":
+                return base_price + spread_adjustment
+            elif urgency == "LOW":
+                return base_price - spread_adjustment
+            else:
+                return base_price
+        else:
+            base_price = metrics.bid
+            if urgency == "HIGH":
+                return base_price - spread_adjustment
+            elif urgency == "LOW":
+                return base_price + spread_adjustment
+            else:
+                return base_price
+    
+    def _calculate_suggested_quantity(
+        self,
+        metrics: MarketMetrics,
+        total_quantity: Decimal,
+        urgency: str
+    ) -> Decimal:
+        """Calculate suggested quantity for each order"""
+        if urgency == "HIGH":
+            return total_quantity
+        
+        # Calculate based on average trade size
+        suggested = min(
+            metrics.average_trade_size * Decimal('2'),
+            total_quantity
+        )
+        
+        # Ensure minimum size
+        return max(suggested, self.min_trade_size)
+    
+    def _estimate_market_impact(
+        self,
+        metrics: MarketMetrics,
+        quantity: Decimal,
+        price: Decimal
+    ) -> Decimal:
+        """Estimate market impact of the trade"""
+        # Calculate permanent impact
+        permanent_impact = (
+            self.permanent_impact_factor *
+            (quantity / metrics.volume) *
+            metrics.volatility
+        )
+        
+        # Calculate temporary impact
+        temporary_impact = (
+            self.temporary_impact_factor *
+            (quantity / metrics.volume) *
+            metrics.spread
+        )
+        
+        return permanent_impact + temporary_impact
+    
+    def _calculate_confidence_score(
+        self,
+        metrics: MarketMetrics,
+        impact: Decimal
+    ) -> float:
+        """Calculate confidence score for the optimization"""
+        # Base score
+        score = 1.0
+        
+        # Reduce score based on market conditions
+        if metrics.volatility > Decimal('0.02'):
+            score *= 0.8
+        if impact > self.impact_threshold:
+            score *= 0.7
+        if metrics.spread > metrics.price * Decimal('0.001'):
+            score *= 0.9
+            
+        return max(0.1, min(1.0, score))
+    
+    def _calculate_time_window(
+        self,
+        metrics: MarketMetrics,
+        quantity: Decimal,
+        urgency: str
+    ) -> int:
+        """Calculate suggested time window for execution"""
+        # Base window on urgency
+        if urgency == "HIGH":
+            base_window = 300  # 5 minutes
+        elif urgency == "LOW":
+            base_window = 3600  # 1 hour
+        else:
+            base_window = 1800  # 30 minutes
+        
+        # Adjust for quantity
+        volume_participation = quantity / metrics.volume
+        if volume_participation > Decimal('0.1'):
+            base_window *= 2
+        
+        return base_window
+    
+    def _determine_order_type(
+        self,
+        metrics: MarketMetrics,
+        urgency: str
+    ) -> str:
+        """Determine optimal order type"""
+        if urgency == "HIGH":
+            return "MARKET"
+        elif urgency == "LOW":
+            return "LIMIT"
+        else:
+            return "LIMIT" if metrics.spread < metrics.price * Decimal('0.001') else "MARKET"
+    
+    def _calculate_volatility(self, trades: List[Dict]) -> Decimal:
+        """Calculate recent price volatility"""
+        if not trades:
+            return Decimal('0')
+        
+        prices = [Decimal(str(t['price'])) for t in trades]
+        returns = np.diff(np.log([float(p) for p in prices]))
+        return Decimal(str(np.std(returns) * np.sqrt(252)))
+    
+    def _calculate_spread(self, symbol: str) -> Decimal:
+        """Calculate current bid-ask spread"""
+        bid = self.market_data_manager.get_bid(symbol)
+        ask = self.market_data_manager.get_ask(symbol)
+        
+        if not bid or not ask:
+            return Decimal('0')
+            
+        return ask - bid
+    
+    def _calculate_volume(self, trades: List[Dict]) -> Decimal:
+        """Calculate recent trading volume"""
+        if not trades:
+            return Decimal('0')
+            
+        return sum(Decimal(str(t['volume'])) for t in trades)
+    
+    def _calculate_average_trade_size(self, trades: List[Dict]) -> Decimal:
+        """Calculate average trade size"""
+        if not trades:
+            return Decimal('0')
+            
+        volumes = [Decimal(str(t['volume'])) for t in trades]
+        return sum(volumes) / len(volumes)
+
+class OptimizationError(Exception):
+    """Custom exception for optimization errors"""
+    pass

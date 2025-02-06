@@ -1,0 +1,273 @@
+[Previous code remains the same]
+
+    def _wait_for_status(self, status: FPGAStatus, timeout: float = 1.0) -> bool:
+        """Wait for specific FPGA status"""
+        start_time = time.time()
+        while (time.time() - start_time) < timeout:
+            current_status = self._read_register(FPGARegister.STATUS)
+            if current_status == status.value:
+                return True
+            time.sleep(0.001)  # 1ms sleep
+        return False
+    
+    def _start_monitor(self) -> None:
+        """Start FPGA monitoring thread"""
+        def monitor():
+            while True:
+                try:
+                    # Check FPGA status
+                    status = self._read_register(FPGARegister.STATUS)
+                    
+                    # Handle interrupts
+                    if self._read_register(FPGARegister.INTERRUPT):
+                        self._handle_interrupt()
+                    
+                    # Process output data
+                    self._process_output_data()
+                    
+                    time.sleep(0.0001)  # 100μs sleep
+                    
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        FPGAError(f"FPGA monitoring failed: {str(e)}")
+                    )
+        
+        threading.Thread(target=monitor, daemon=True).start()
+    
+    def _handle_interrupt(self) -> None:
+        """Handle FPGA interrupt"""
+        try:
+            # Read interrupt type
+            interrupt_type = self._read_register(FPGARegister.INTERRUPT)
+            
+            if interrupt_type & 0x1:  # Market data update
+                self._handle_market_data_interrupt()
+            elif interrupt_type & 0x2:  # Order execution
+                self._handle_order_interrupt()
+            elif interrupt_type & 0x4:  # Error condition
+                self._handle_error_interrupt()
+            
+            # Clear interrupt
+            self._write_register(FPGARegister.INTERRUPT, 0)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Interrupt handling failed: {str(e)}")
+            )
+    
+    def _handle_market_data_interrupt(self) -> None:
+        """Handle market data interrupt"""
+        try:
+            # Read market data size
+            data_size = self._read_register(FPGARegister.DATA_OUT)
+            
+            # Read market data
+            market_data = self._read_data(data_size)
+            
+            # Process market data
+            self._process_market_data(market_data)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Market data interrupt handling failed: {str(e)}")
+            )
+    
+    def _handle_order_interrupt(self) -> None:
+        """Handle order execution interrupt"""
+        try:
+            # Read order execution data
+            data_size = self._read_register(FPGARegister.DATA_OUT)
+            order_data = self._read_data(data_size)
+            
+            # Process order execution
+            self._process_order_execution(order_data)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Order interrupt handling failed: {str(e)}")
+            )
+    
+    def _handle_error_interrupt(self) -> None:
+        """Handle error interrupt"""
+        try:
+            # Read error code
+            error_code = self._read_register(FPGARegister.DATA_OUT)
+            
+            # Log error
+            self.logger.log_event(
+                "FPGA_ERROR",
+                f"FPGA error occurred: {error_code}",
+                level="ERROR"
+            )
+            
+            # Reset FPGA if necessary
+            if error_code & 0x8000:  # Critical error
+                self._reset_fpga()
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Error interrupt handling failed: {str(e)}")
+            )
+    
+    def _process_market_data(self, data: bytes) -> None:
+        """Process market data from FPGA"""
+        try:
+            # Unpack market data structure
+            # Format: symbol(16), timestamp(8), price(8), size(4), flags(4)
+            market_data = struct.unpack('16sQdII', data)
+            
+            # Create market data event
+            event = {
+                'symbol': market_data[0].decode().strip('\0'),
+                'timestamp': market_data[1],
+                'price': market_data[2],
+                'size': market_data[3],
+                'flags': market_data[4]
+            }
+            
+            # Notify listeners
+            self._notify_market_data(event)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Market data processing failed: {str(e)}")
+            )
+    
+    def _process_order_execution(self, data: bytes) -> None:
+        """Process order execution from FPGA"""
+        try:
+            # Unpack order execution structure
+            # Format: order_id(8), timestamp(8), price(8), size(4), flags(4)
+            execution = struct.unpack('QQdII', data)
+            
+            # Create execution event
+            event = {
+                'order_id': execution[0],
+                'timestamp': execution[1],
+                'price': execution[2],
+                'size': execution[3],
+                'flags': execution[4]
+            }
+            
+            # Notify listeners
+            self._notify_order_execution(event)
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Order execution processing failed: {str(e)}")
+            )
+    
+    def submit_order(self, order: Dict) -> bool:
+        """Submit order to FPGA for processing"""
+        try:
+            # Pack order data
+            order_data = struct.pack(
+                'QQdII',
+                order['order_id'],
+                int(time.time() * 1e9),  # Current timestamp in nanoseconds
+                order['price'],
+                order['size'],
+                order['flags']
+            )
+            
+            # Write order to FPGA
+            self._write_register(FPGARegister.DATA_IN, len(order_data))
+            self._write_data(order_data)
+            
+            # Wait for acknowledgment
+            if not self._wait_for_status(FPGAStatus.READY, timeout=0.001):
+                raise FPGAError("Order submission timeout")
+            
+            return True
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Order submission failed: {str(e)}")
+            )
+            return False
+    
+    def _reset_fpga(self) -> None:
+        """Reset FPGA to initial state"""
+        try:
+            # Send reset command
+            self._write_register(
+                FPGARegister.CONTROL,
+                FPGACommand.RESET.value
+            )
+            
+            # Wait for reset completion
+            if not self._wait_for_status(FPGAStatus.READY):
+                raise FPGAError("FPGA reset timeout")
+            
+            # Reconfigure FPGA
+            self._configure_fpga()
+            
+            self.logger.log_event(
+                "FPGA_RESET",
+                "FPGA reset completed"
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"FPGA reset failed: {str(e)}")
+            )
+    
+    def get_fpga_stats(self) -> Dict:
+        """Get FPGA performance statistics"""
+        try:
+            stats = {
+                'status': FPGAStatus(
+                    self._read_register(FPGARegister.STATUS)
+                ).name,
+                'uptime': time.time() - self._start_time,
+                'market_data_processed': self._market_data_count,
+                'orders_processed': self._orders_count,
+                'errors': self._error_count,
+                'latency': {
+                    'market_data': self._calculate_latency_stats(
+                        self._market_data_latencies
+                    ),
+                    'order': self._calculate_latency_stats(
+                        self._order_latencies
+                    )
+                }
+            }
+            
+            return stats
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"Failed to get FPGA stats: {str(e)}")
+            )
+            return {}
+    
+    def cleanup(self) -> None:
+        """Cleanup FPGA resources"""
+        try:
+            # Stop FPGA
+            self._write_register(
+                FPGARegister.CONTROL,
+                FPGACommand.STOP.value
+            )
+            
+            # Unmap memory
+            if self.mmap:
+                self.mmap.close()
+            
+            # Close device
+            if self.device:
+                os.close(self.device)
+            
+            self.logger.log_event(
+                "FPGA_CLEANUP",
+                "FPGA resources cleaned up"
+            )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                FPGAError(f"FPGA cleanup failed: {str(e)}")
+            )
+
+class FPGAError(Exception):
+    """Custom exception for FPGA-related errors"""
+    pass

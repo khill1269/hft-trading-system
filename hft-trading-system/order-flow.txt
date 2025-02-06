@@ -1,0 +1,359 @@
+from typing import Dict, Optional, List, Callable, Set
+from decimal import Decimal
+from datetime import datetime
+from enum import Enum
+import asyncio
+import uuid
+from dataclasses import dataclass
+import threading
+from collections import deque
+
+class OrderState(Enum):
+    CREATED = "CREATED"
+    VALIDATED = "VALIDATED"
+    ROUTED = "ROUTED"
+    EXECUTING = "EXECUTING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    ERROR = "ERROR"
+
+class OrderPriority(Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    URGENT = "URGENT"
+
+@dataclass
+class OrderRoute:
+    venue: str
+    strategy: str
+    priority: OrderPriority
+    max_participation_rate: Decimal
+    time_window: Optional[int] = None  # seconds
+    dark_pool_enabled: bool = False
+
+@dataclass
+class OrderEvent:
+    timestamp: datetime
+    event_type: str
+    order_id: str
+    details: Dict
+    old_state: Optional[OrderState] = None
+    new_state: Optional[OrderState] = None
+
+class OrderFlowManager:
+    """Manages order flow and routing"""
+    
+    def __init__(
+        self,
+        execution_engine,
+        risk_manager,
+        market_data_manager,
+        config: Dict,
+        logger,
+        error_handler
+    ):
+        self.execution_engine = execution_engine
+        self.risk_manager = risk_manager
+        self.market_data_manager = market_data_manager
+        self.config = config
+        self.logger = logger
+        self.error_handler = error_handler
+        
+        # Order tracking
+        self._orders: Dict[str, Order] = {}
+        self._order_routes: Dict[str, OrderRoute] = {}
+        self._order_events: Dict[str, List[OrderEvent]] = {}
+        
+        # Order queues by priority
+        self._order_queues: Dict[OrderPriority, deque] = {
+            priority: deque() for priority in OrderPriority
+        }
+        
+        # Active venues and their states
+        self._active_venues: Set[str] = set()
+        self._venue_states: Dict[str, bool] = {}  # True if venue is healthy
+        
+        # Rate limiting
+        self._rate_limits: Dict[str, int] = {}  # orders per second by venue
+        self._venue_counters: Dict[str, int] = {}
+        
+        # Thread safety
+        self._lock = threading.Lock()
+        
+        # Start order processor
+        self._start_order_processor()
+    
+    async def submit_order(
+        self,
+        order: Order,
+        route: Optional[OrderRoute] = None
+    ) -> str:
+        """Submit an order for processing"""
+        try:
+            # Generate order ID
+            order_id = str(uuid.uuid4())
+            order.order_id = order_id
+            
+            # Validate order
+            if not self._validate_order(order):
+                return None
+            
+            # Determine route if not provided
+            if not route:
+                route = self._determine_optimal_route(order)
+            
+            with self._lock:
+                # Store order and route
+                self._orders[order_id] = order
+                self._order_routes[order_id] = route
+                self._order_events[order_id] = []
+                
+                # Add to priority queue
+                self._order_queues[route.priority].append(order_id)
+                
+                # Log submission
+                self._add_order_event(
+                    order_id,
+                    "SUBMITTED",
+                    {"route": route.venue, "priority": route.priority.value}
+                )
+            
+            return order_id
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Order submission failed: {str(e)}")
+            )
+            return None
+    
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an order"""
+        try:
+            with self._lock:
+                if order_id not in self._orders:
+                    return False
+                
+                order = self._orders[order_id]
+                if order.state in {OrderState.COMPLETED, OrderState.CANCELLED}:
+                    return False
+                
+                # Remove from queue if not yet executing
+                if order.state in {OrderState.CREATED, OrderState.VALIDATED, OrderState.ROUTED}:
+                    route = self._order_routes[order_id]
+                    queue = self._order_queues[route.priority]
+                    if order_id in queue:
+                        queue.remove(order_id)
+                
+                # Cancel if executing
+                if order.state == OrderState.EXECUTING:
+                    self.execution_engine.cancel_order(order_id)
+                
+                order.state = OrderState.CANCELLED
+                self._add_order_event(order_id, "CANCELLED", {})
+                
+                return True
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Order cancellation failed: {str(e)}")
+            )
+            return False
+    
+    def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """Get current order status"""
+        with self._lock:
+            if order_id not in self._orders:
+                return None
+            
+            order = self._orders[order_id]
+            route = self._order_routes[order_id]
+            events = self._order_events[order_id]
+            
+            return {
+                "order_id": order_id,
+                "state": order.state.value,
+                "venue": route.venue,
+                "priority": route.priority.value,
+                "events": [
+                    {
+                        "timestamp": e.timestamp.isoformat(),
+                        "type": e.event_type,
+                        "details": e.details
+                    }
+                    for e in events
+                ]
+            }
+    
+    def _validate_order(self, order: Order) -> bool:
+        """Validate order parameters"""
+        try:
+            # Basic validation
+            if not order.symbol or not order.quantity or not order.side:
+                return False
+            
+            # Check risk limits
+            if not self.risk_manager.check_order_risk(
+                order.symbol,
+                order.side,
+                order.quantity,
+                order.price or self.market_data_manager.get_latest_price(order.symbol)
+            ):
+                return False
+            
+            # Update order state
+            order.state = OrderState.VALIDATED
+            return True
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                OrderFlowError(f"Order validation failed: {str(e)}")
+            )
+            return False
+    
+    def _determine_optimal_route(self, order: Order) -> OrderRoute:
+        """Determine optimal routing strategy"""
+        # Get market conditions
+        spread = self.market_data_manager.get_spread(order.symbol)
+        volatility = self.market_data_manager.get_volatility(order.symbol)
+        volume = self.market_data_manager.get_volume(order.symbol)
+        
+        # Determine priority
+        if order.time_in_force == "IOC" or getattr(order, 'urgent', False):
+            priority = OrderPriority.URGENT
+        elif volatility > Decimal('0.02'):
+            priority = OrderPriority.HIGH
+        elif spread > Decimal('0.001'):
+            priority = OrderPriority.LOW
+        else:
+            priority = OrderPriority.MEDIUM
+        
+        # Select venue based on order size and market conditions
+        if order.quantity > volume * Decimal('0.1'):
+            venue = "DARK_POOL"
+            dark_pool_enabled = True
+        else:
+            venue = self._select_best_venue(order.symbol)
+            dark_pool_enabled = False
+        
+        return OrderRoute(
+            venue=venue,
+            strategy="NORMAL",
+            priority=priority,
+            max_participation_rate=Decimal('0.3'),
+            dark_pool_enabled=dark_pool_enabled
+        )
+    
+    def _select_best_venue(self, symbol: str) -> str:
+        """Select best execution venue"""
+        # Filter healthy venues
+        available_venues = [
+            venue for venue, healthy in self._venue_states.items()
+            if healthy
+        ]
+        
+        if not available_venues:
+            return self.config.get('default_venue', 'PRIMARY')
+        
+        # Check venue load
+        venue_loads = {
+            venue: self._venue_counters.get(venue, 0)
+            for venue in available_venues
+        }
+        
+        # Select least loaded venue
+        return min(venue_loads.items(), key=lambda x: x[1])[0]
+    
+    def _start_order_processor(self) -> None:
+        """Start order processing thread"""
+        def processor_thread():
+            while True:
+                try:
+                    self._process_order_queues()
+                except Exception as e:
+                    self.error_handler.handle_error(
+                        OrderFlowError(f"Order processor error: {str(e)}")
+                    )
+                time.sleep(0.1)
+        
+        thread = threading.Thread(target=processor_thread, daemon=True)
+        thread.start()
+    
+    def _process_order_queues(self) -> None:
+        """Process orders from priority queues"""
+        for priority in OrderPriority:
+            queue = self._order_queues[priority]
+            
+            while queue:
+                with self._lock:
+                    order_id = queue[0]
+                    
+                    # Check if order can be processed
+                    if not self._can_process_order(order_id):
+                        break
+                    
+                    # Remove from queue
+                    queue.popleft()
+                    
+                    # Process order
+                    order = self._orders[order_id]
+                    route = self._order_routes[order_id]
+                    
+                    # Update state
+                    order.state = OrderState.EXECUTING
+                    self._add_order_event(
+                        order_id,
+                        "EXECUTING",
+                        {"venue": route.venue}
+                    )
+                    
+                    # Submit to execution engine
+                    asyncio.create_task(
+                        self.execution_engine.execute_order(order, route)
+                    )
+    
+    def _can_process_order(self, order_id: str) -> bool:
+        """Check if order can be processed"""
+        order = self._orders[order_id]
+        route = self._order_routes[order_id]
+        
+        # Check venue health
+        if not self._venue_states.get(route.venue, True):
+            return False
+        
+        # Check rate limits
+        if self._venue_counters.get(route.venue, 0) >= self._rate_limits.get(route.venue, 100):
+            return False
+        
+        return True
+    
+    def _add_order_event(
+        self,
+        order_id: str,
+        event_type: str,
+        details: Dict,
+        old_state: Optional[OrderState] = None,
+        new_state: Optional[OrderState] = None
+    ) -> None:
+        """Add event to order history"""
+        event = OrderEvent(
+            timestamp=datetime.utcnow(),
+            event_type=event_type,
+            order_id=order_id,
+            details=details,
+            old_state=old_state,
+            new_state=new_state
+        )
+        
+        self._order_events[order_id].append(event)
+        
+        self.logger.log_event(
+            f"ORDER_{event_type}",
+            f"Order {order_id} {event_type.lower()}",
+            extra_data=details
+        )
+
+class OrderFlowError(Exception):
+    """Custom exception for order flow errors"""
+    pass

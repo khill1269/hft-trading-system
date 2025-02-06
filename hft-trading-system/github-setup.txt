@@ -1,0 +1,110 @@
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install Poetry
+      run: |
+        curl -sSL https://install.python-poetry.org | python3 -
+    
+    - name: Install dependencies
+      run: |
+        poetry install
+    
+    - name: Run tests
+      run: |
+        poetry run pytest --cov=src tests/
+      env:
+        DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379
+        ENVIRONMENT: test
+    
+    - name: Run linting
+      run: |
+        poetry run black . --check
+        poetry run pylint src tests
+        poetry run mypy src
+
+# scripts/setup.sh
+#!/bin/bash
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo -e "${GREEN}Setting up HFT Trading System...${NC}"
+
+# Check Python version
+python_version=$(python3 -V 2>&1 | sed 's/.* \([0-9]\).\([0-9]\).*/\1\2/')
+if [ "$python_version" -lt "39" ]; then
+    echo -e "${RED}Python 3.9 or higher is required${NC}"
+    exit 1
+fi
+
+# Install Poetry if not installed
+if ! command -v poetry &> /dev/null; then
+    echo -e "${GREEN}Installing Poetry...${NC}"
+    curl -sSL https://install.python-poetry.org | python3 -
+fi
+
+# Install dependencies
+echo -e "${GREEN}Installing dependencies...${NC}"
+poetry install
+
+# Set up pre-commit hooks
+echo -e "${GREEN}Setting up pre-commit hooks...${NC}"
+poetry run pre-commit install
+
+# Create necessary directories
+echo -e "${GREEN}Creating directory structure...${NC}"
+mkdir -p {src/{core,market_data,execution,risk,ai,utils},config,tests,docs}
+
+# Copy example config
+echo -e "${GREEN}Setting up configuration...${NC}"
+if [ ! -f .env ]; then
+    cp .env.example .env
+fi
+
+echo -e "${GREEN}Setup complete!${NC}"
+echo "Next steps:"
+echo "1. Edit .env with your settings"
+echo "2. Run 'poetry shell' to activate virtual environment"
+echo "3. Run 'pytest' to verify setup"

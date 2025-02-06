@@ -1,0 +1,347 @@
+[Previous code remains the same until _check_resource_health]
+
+    def _check_resource_health(self, version_id: str) -> bool:
+        """Check model resource usage"""
+        try:
+            # Get resource metrics
+            response = self._github_api_request(
+                'GET',
+                f'/models/{version_id}/metrics'
+            )
+            
+            if response.status_code != 200:
+                return False
+            
+            metrics = response.json()
+            
+            # Check CPU usage
+            cpu_usage = metrics.get('cpu_usage', 0)
+            if cpu_usage > 80:  # 80% CPU threshold
+                return False
+            
+            # Check memory usage
+            memory_usage = metrics.get('memory_usage', 0)
+            if memory_usage > 85:  # 85% memory threshold
+                return False
+            
+            # Check API rate limits
+            rate_limit_usage = metrics.get('rate_limit_usage', 0)
+            if rate_limit_usage > 90:  # 90% of rate limit
+                return False
+            
+            # Check error rates
+            error_rate = metrics.get('error_rate', 0)
+            if error_rate > 0.05:  # 5% error rate threshold
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.log_event(
+                "RESOURCE_CHECK_ERROR",
+                f"Resource health check failed: {str(e)}"
+            )
+            return False
+    
+    def _handle_health_issue(
+        self,
+        model_type: ModelType,
+        health_metrics: Dict
+    ) -> None:
+        """Handle detected health issues"""
+        try:
+            issue_type = self._determine_issue_type(health_metrics)
+            
+            self.logger.log_event(
+                "MODEL_HEALTH_ISSUE",
+                f"Health issue detected for {model_type.value}",
+                extra_data={
+                    "issue_type": issue_type,
+                    "metrics": health_metrics
+                }
+            )
+            
+            if issue_type == "PERFORMANCE":
+                asyncio.create_task(
+                    self._handle_performance_degradation(
+                        model_type,
+                        health_metrics['version_id']
+                    )
+                )
+            elif issue_type == "RESOURCE":
+                asyncio.create_task(
+                    self._handle_resource_issue(
+                        model_type,
+                        health_metrics['version_id']
+                    )
+                )
+            elif issue_type == "STABILITY":
+                asyncio.create_task(
+                    self._handle_stability_issue(
+                        model_type,
+                        health_metrics['version_id']
+                    )
+                )
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                ModelError(f"Health issue handling failed: {str(e)}")
+            )
+    
+    async def _handle_resource_issue(
+        self,
+        model_type: ModelType,
+        version_id: str
+    ) -> None:
+        """Handle resource-related issues"""
+        try:
+            # Request resource scaling
+            response = self._github_api_request(
+                'POST',
+                f'/models/{version_id}/scale',
+                json={
+                    'action': 'scale_up',
+                    'reason': 'resource_constraint'
+                }
+            )
+            
+            if response.status_code == 200:
+                self.logger.log_event(
+                    "RESOURCE_SCALING",
+                    f"Requested resource scaling for {version_id}"
+                )
+                
+                # Monitor scaling progress
+                await self._monitor_scaling(version_id)
+            else:
+                # If scaling fails, try to switch to a different version
+                await self._emergency_model_switch(model_type, version_id)
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                ModelError(f"Resource issue handling failed: {str(e)}")
+            )
+    
+    async def _handle_stability_issue(
+        self,
+        model_type: ModelType,
+        version_id: str
+    ) -> None:
+        """Handle model stability issues"""
+        try:
+            # Get model configuration
+            response = self._github_api_request(
+                'GET',
+                f'/models/{version_id}/config'
+            )
+            
+            if response.status_code == 200:
+                config = response.json()
+                
+                # Adjust stability parameters
+                new_config = self._adjust_stability_params(config)
+                
+                # Apply new configuration
+                response = self._github_api_request(
+                    'POST',
+                    f'/models/{version_id}/config',
+                    json=new_config
+                )
+                
+                if response.status_code == 200:
+                    self.logger.log_event(
+                        "STABILITY_ADJUSTMENT",
+                        f"Applied stability adjustments to {version_id}",
+                        extra_data={"new_config": new_config}
+                    )
+                else:
+                    # If adjustment fails, consider model switch
+                    await self._emergency_model_switch(model_type, version_id)
+                    
+        except Exception as e:
+            self.error_handler.handle_error(
+                ModelError(f"Stability issue handling failed: {str(e)}")
+            )
+    
+    async def _emergency_model_switch(
+        self,
+        model_type: ModelType,
+        current_version_id: str
+    ) -> None:
+        """Perform emergency switch to backup model"""
+        try:
+            # Find most recent stable version
+            stable_version = self._find_stable_version(model_type)
+            
+            if stable_version and stable_version != current_version_id:
+                # Activate backup version
+                success = await self.activate_model(
+                    model_type,
+                    stable_version
+                )
+                
+                if success:
+                    self.logger.log_event(
+                        "EMERGENCY_SWITCH",
+                        f"Emergency switch to {stable_version}",
+                        extra_data={
+                            "model_type": model_type.value,
+                            "previous_version": current_version_id
+                        }
+                    )
+                else:
+                    raise ModelError("Emergency switch failed")
+            else:
+                raise ModelError("No stable version available")
+                
+        except Exception as e:
+            self.error_handler.handle_error(
+                ModelError(f"Emergency switch failed: {str(e)}")
+            )
+    
+    def _find_stable_version(
+        self,
+        model_type: ModelType
+    ) -> Optional[str]:
+        """Find most recent stable version"""
+        try:
+            stable_versions = []
+            
+            for version_id, version in self._models[model_type].items():
+                # Check version stability
+                if self._is_version_stable(version):
+                    stable_versions.append(version)
+            
+            if not stable_versions:
+                return None
+            
+            # Return most recent stable version
+            return max(
+                stable_versions,
+                key=lambda v: v.created_at
+            ).version_id
+            
+        except Exception:
+            return None
+    
+    def _is_version_stable(self, version: ModelVersion) -> bool:
+        """Check if model version is stable"""
+        try:
+            metrics = version.performance_metrics
+            
+            # Define stability criteria
+            criteria = {
+                'error_rate': lambda x: x < 0.05,
+                'latency_p95': lambda x: x < 1.0,
+                'stability_score': lambda x: x > 0.8
+            }
+            
+            return all(
+                criteria[metric](metrics.get(metric, 0))
+                for metric in criteria
+                if metric in metrics
+            )
+            
+        except Exception:
+            return False
+    
+    def _determine_issue_type(
+        self,
+        health_metrics: Dict
+    ) -> str:
+        """Determine type of health issue"""
+        metrics = health_metrics.get('metrics', {})
+        
+        if not metrics.get('performance_ok'):
+            return "PERFORMANCE"
+        elif not metrics.get('resources_ok'):
+            return "RESOURCE"
+        elif not metrics.get('stability_ok'):
+            return "STABILITY"
+        else:
+            return "UNKNOWN"
+    
+    def _adjust_stability_params(self, config: Dict) -> Dict:
+        """Adjust model parameters for better stability"""
+        new_config = config.copy()
+        
+        # Adjust prediction parameters
+        if 'prediction' in new_config:
+            pred_config = new_config['prediction']
+            pred_config['temperature'] = min(
+                pred_config.get('temperature', 0.7) * 0.8,
+                0.5
+            )
+            pred_config['top_p'] = min(
+                pred_config.get('top_p', 0.9) * 0.9,
+                0.7
+            )
+        
+        # Adjust batch processing
+        if 'batch_size' in new_config:
+            new_config['batch_size'] = max(
+                1,
+                int(new_config['batch_size'] * 0.7)
+            )
+        
+        # Add stability settings
+        new_config['stability_settings'] = {
+            'enable_smoothing': True,
+            'moving_average_window': 5,
+            'outlier_detection': True,
+            'confidence_threshold': 0.8
+        }
+        
+        return new_config
+    
+    async def _monitor_scaling(self, version_id: str) -> None:
+        """Monitor scaling operation progress"""
+        max_attempts = 30
+        attempt = 0
+        
+        while attempt < max_attempts:
+            response = self._github_api_request(
+                'GET',
+                f'/models/{version_id}/status'
+            )
+            
+            if response.status_code == 200:
+                status = response.json()
+                
+                if status['scaling_status'] == 'completed':
+                    self.logger.log_event(
+                        "SCALING_COMPLETE",
+                        f"Scaling completed for {version_id}"
+                    )
+                    return
+                    
+                elif status['scaling_status'] == 'failed':
+                    raise ModelError(f"Scaling failed: {status.get('error')}")
+            
+            await asyncio.sleep(10)  # Check every 10 seconds
+            attempt += 1
+        
+        raise ModelError("Scaling operation timeout")
+
+    def get_model_insights(self, model_type: ModelType) -> Dict:
+        """Get insights about model performance and usage"""
+        try:
+            insights = {
+                'current_version': self._active_models.get(model_type),
+                'performance_trend': self._get_performance_trend(model_type),
+                'resource_utilization': self._get_resource_utilization(model_type),
+                'error_analysis': self._get_error_analysis(model_type),
+                'usage_statistics': self._get_usage_statistics(model_type)
+            }
+            
+            return insights
+            
+        except Exception as e:
+            self.error_handler.handle_error(
+                ModelError(f"Failed to get model insights: {str(e)}")
+            )
+            return {}
+
+class ModelError(Exception):
+    """Custom exception for model-related errors"""
+    pass
