@@ -1,13 +1,12 @@
-import sys
-import os
+import unittest
+from src.trade_execution.trade_execution import TradeExecution
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
-
-from trade_execution import trade_execution
-
-class TestTradeExecution:
+class TestTradeExecution(unittest.TestCase):
     def test_execute_trade(self):
-        trade_exec = trade_execution.TradeExecution()
+        trade_exec = TradeExecution()
         result = trade_exec.execute_trade_ibkr("AAPL", 10, "BUY")
-        assert result is None  # Adjust based on actual return
+        self.assertIsNone(result)
+
+if __name__ == "__main__":
+    unittest.main()
 
