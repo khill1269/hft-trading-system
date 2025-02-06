@@ -1,0 +1,9 @@
+trading_mode: "paper"  # Change to "live" for real trading
+
+api_keys:
+  ibkr: "your_ibkr_key_here"
+  github: "your_github_api_key_here"
+
+execution:
+  enable_fpga_acceleration: true
+
